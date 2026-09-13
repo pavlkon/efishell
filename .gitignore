@@ -1,0 +1,13 @@
+*.o
+*.efi
+*.img
+*.vdi
+*.EFI
+OVMF_VARS.fd
+
+kernel.old.c
+kernel.old.h
+os.old.c
+
+correct.sh
+image/
