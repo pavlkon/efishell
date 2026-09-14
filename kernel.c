@@ -9,9 +9,9 @@
 #define PMM_PAGE_SIZE 4096ULL
 #define PMM_MAX_PAGES (256ULL * 262144ULL)
 #define USER_SLOT 128
-#define STACK_PAGES 8
-#define MAX_PROCESSES 24
-#define MAX_AS 32
+#define STACK_PAGES 32
+#define MAX_PROCESSES K_MAX_PROCESSES
+#define MAX_AS 72
 #define MAX_USER_PAGES 16384
 #define MAX_REGIONS 64
 #define MAX_EXPORTS 64
@@ -30,7 +30,7 @@ static void mem_copy(void *d, const void *s, UINTN n)
     while (n--)
         *a++ = *b++;
 }
-/* GCC may emit these even in a freestanding PE image. */
+/* GCC may emit these in a freestanding PE image. */
 void *memset(void *p, int v, size_t n)
 {
     UINT8 *d = p;
@@ -66,10 +66,8 @@ int memcmp(const void *a, const void *b, size_t n)
     }
     return 0;
 }
-/* MinGW emits this for large stack frames even with -fno-stack-check.
- * Preserve its special ABI (RAX contains the requested size; all GPRs survive)
- * so the original -nostdlib build needs no libgcc/CRT dependency. Stacks are
- * fully allocated: probing does not implement automatic stack growth. */
+/* MinGW may emit ___chkstk_ms even with -fno-stack-check.
+ * RAX holds the size and all GPRs must survive; stacks are fully allocated. */
 __asm__(".text\n.globl ___chkstk_ms\n___chkstk_ms:\n"
         "pushq %rcx\npushq %rax\nleaq 24(%rsp),%rcx\n"
         "1: cmpq $4096,%rax\njb 2f\nsubq $4096,%rcx\ntestq %rcx,(%rcx)\n"
@@ -101,15 +99,9 @@ static void str_copy(char *d, const char *s, UINTN cap)
     }
     d[i] = 0;
 }
-static BOOLEAN span_ok(UINT64 off, UINT64 n, UINT64 size)
-{
-    return off <= size && n <= size - off;
-}
+static BOOLEAN span_ok(UINT64 off, UINT64 n, UINT64 size) { return off <= size && n <= size - off; }
 static BOOLEAN overlap(UINT64, UINT64, UINT64, UINT64);
-static BOOLEAN power2(UINT64 n)
-{
-    return n && !(n & (n - 1));
-}
+static BOOLEAN power2(UINT64 n) { return n && !(n & (n - 1)); }
 static UINT16 rd16(const void *p)
 {
     const UINT8 *b = p;
@@ -125,6 +117,12 @@ static UINT64 rd64(const void *p)
     const UINT8 *b = p;
     return rd32(b) | ((UINT64)rd32(b + 4) << 32);
 }
+static void wr16(void *p, UINT16 v)
+{
+    UINT8 *b = p;
+    b[0] = (UINT8)v;
+    b[1] = (UINT8)(v >> 8);
+}
 static void wr32(void *p, UINT32 v)
 {
     UINT8 *b = p;
@@ -137,10 +135,7 @@ static void wr64(void *p, UINT64 v)
     for (int i = 0; i < 8; ++i)
         b[i] = (UINT8)(v >> (i * 8));
 }
-static inline void pause_cpu(void)
-{
-    __asm__ volatile("pause" ::: "memory");
-}
+static inline void pause_cpu(void) { __asm__ volatile("pause" ::: "memory"); }
 static inline UINT8 inb(UINT16 p)
 {
     UINT8 v;
@@ -159,18 +154,9 @@ static inline UINT32 inl(UINT16 p)
     __asm__ volatile("inl %1,%0" : "=a"(v) : "Nd"(p));
     return v;
 }
-static inline void outb(UINT16 p, UINT8 v)
-{
-    __asm__ volatile("outb %0,%1" ::"a"(v), "Nd"(p));
-}
-static inline void outw(UINT16 p, UINT16 v)
-{
-    __asm__ volatile("outw %0,%1" ::"a"(v), "Nd"(p));
-}
-static inline void outl(UINT16 p, UINT32 v)
-{
-    __asm__ volatile("outl %0,%1" ::"a"(v), "Nd"(p));
-}
+static inline void outb(UINT16 p, UINT8 v) { __asm__ volatile("outb %0,%1" ::"a"(v), "Nd"(p)); }
+static inline void outw(UINT16 p, UINT16 v) { __asm__ volatile("outw %0,%1" ::"a"(v), "Nd"(p)); }
+static inline void outl(UINT16 p, UINT32 v) { __asm__ volatile("outl %0,%1" ::"a"(v), "Nd"(p)); }
 static UINT64 rdmsr(UINT32 m)
 {
     UINT32 a, d;
@@ -287,12 +273,14 @@ typedef struct task {
     INT32 exit_code;
     UINT32 preempt_depth, mail_head, mail_count;
     BOOLEAN idle;
+    UINT64 fs_base;
+    UINT32 control_request;
     k_message mail[MAIL_DEPTH];
     UINT8 fx[512] __attribute__((aligned(16)));
 } task;
 typedef struct {
-    UINT64 syscall_stack, syscall_user_rsp;
-    task *stack_owner, *current;
+    UINT64 syscall_stack, syscall_user_rsp; /* assembly offsets 0, 8 */
+    task *stack_owner, *current;            /* assembly offsets 16, 24 */
     UINT32 index, apic_id;
     volatile UINT32 online;
     UINT64 ticks, switches, fair_floor, idle_ticks;
@@ -311,9 +299,14 @@ struct k_address_space {
     UINT64 *pml4, next;
     UINT32 pages;
     k_process *owner;
+    UINT64 private_slots[4]; /* verified user-owned PML4 subtrees only */
 };
 struct k_process {
     BOOLEAN used, loaded;
+    UINT32 parent, execution_class;
+    UINT8 uuid[16];
+    UINT64 tls;
+    char arguments[K_PROCESS_ARGS_MAX];
     UINT32 id, task_id, state, fault_vector;
     INT32 exit_code;
     UINT64 fault_address, fault_ip, entry, user_stack;
@@ -337,6 +330,8 @@ static struct k_process processes[MAX_PROCESSES];
 static struct k_address_space spaces[MAX_AS];
 static k_spinlock sched_lock = K_SPINLOCK_INIT, pmm_lock = K_SPINLOCK_INIT,
                   vm_lock = K_SPINLOCK_INIT;
+static k_mutex process_mutex = K_MUTEX_INIT;
+static UINT32 input_owner;
 static k_spinlock console_lock = K_SPINLOCK_INIT;
 static BOOLEAN scheduler_ready, interrupts_ready, vm_ready, smp_started;
 static UINT32 next_task_id = 1, next_process_id = 1, timer_hz = 100;
@@ -365,19 +360,17 @@ static void ps2_irq(void);
 static void wake_object(void *);
 static void free_task(task *);
 static task *current_task(void);
+static void task_ready(task *);
+static BOOLEAN process_return_control(task *);
+static INT64 syscall_extended(k_process *, task *, irq_frame *);
+static void process_resources_release(k_process *);
 
-/* Retained framebuffer, font and console implementation follows. */
-
-/* Framebuffer state */
 static UINT32 *fb_base;
-/* Text cells are authoritative. Never read GPU memory to scroll. The second
- * grid records what has already been drawn, so unchanged blank cells cost no
- * PCIe writes. A complete con_print() is presented once, even after scrolling. */
+/* Console RAM is authoritative; scrolling never reads framebuffer memory. */
 static char *con_cells, *con_shown, *con_history;
 #define CON_HISTORY_ROWS 2048
 static UINT32 history_head, history_count, history_view;
-/* One generic binary-alpha bitmap overlay. The OS supplies its contents and
- * position; the console restores it from RAM, never by reading GPU memory. */
+/* Overlay is restored from RAM; framebuffer reads are avoided. */
 static struct {
     INT32 x, y;
     UINT32 width, height, pixels[32 * 32];
@@ -388,15 +381,12 @@ static volatile UINT32 console_emergency;
 static UINT32 fb_width, fb_height, fb_pitch;
 static UINT8 red_shift, green_shift, blue_shift;
 
-/* Text console state */
 #define FONT_W 8
 #define FONT_H 8
 static UINT32 con_cols, con_rows;
 static UINT32 cur_x, cur_y;
 static UINT32 fg_color = 0x00E0E0E0;
 static UINT32 bg_color = 0x00101018;
-
-// 8x8 font
 
 typedef struct {
     char ch;
@@ -485,8 +475,6 @@ static CONST UINT8 *font_lookup(char c)
     return FALLBACK_GLYPH;
 }
 
-// Framebuffer Primitives
-
 static UINT32 fb_pixel(UINT32 rgb)
 {
     return (((rgb >> 16) & 255) << red_shift) | (((rgb >> 8) & 255) << green_shift) |
@@ -497,7 +485,7 @@ static void fb_fill(UINT32 rgb)
     volatile UINT32 *dst = fb_base;
     UINTN count = (UINTN)fb_pitch * fb_height;
     UINT32 pixel = fb_pixel(rgb);
-    /* Write-only, full-width stores; no uncached framebuffer read-modify-write. */
+    /* Write-only full-width stores; avoid uncached framebuffer RMW. */
     __asm__ volatile("cld; rep stosl" : "+D"(dst), "+c"(count) : "a"(pixel) : "memory");
     __asm__ volatile("sfence" ::: "memory");
 }
@@ -600,7 +588,7 @@ static void console_present(void)
 static void fb_scroll_one_line(void)
 {
     if (!con_cells) {
-        /* Early-boot/OOM fallback clears, rather than reading device memory. */
+        /* Early-boot/OOM fallback clears instead of reading device memory. */
         fb_fill(bg_color);
         cur_y = 1;
         return;
@@ -620,9 +608,8 @@ static void fb_scroll_one_line(void)
     memset(con_cells + moved, ' ', con_cols);
     console_dirty(0, con_rows - 1);
 }
-/* Kernel callers print from task context. Keep timer/PS2 IRQs enabled during
- * rendering, but pin the current task so a same-CPU printer cannot deadlock
- * on the console lock. Fault output is best-effort and bypasses this lock. */
+/* Console rendering keeps IRQs enabled but pins the current task while locked.
+ * Fault output bypasses the normal lock. */
 static BOOLEAN console_enter(void)
 {
     if (__atomic_load_n(&console_emergency, __ATOMIC_RELAXED))
@@ -641,10 +628,7 @@ static void console_leave(BOOLEAN locked)
         k_preempt_enable();
     }
 }
-static void console_panic_mode(void)
-{
-    __atomic_store_n(&console_emergency, 1, __ATOMIC_RELAXED);
-}
+static void console_panic_mode(void) { __atomic_store_n(&console_emergency, 1, __ATOMIC_RELAXED); }
 static void console_buffer_init(void)
 {
     UINT64 cells = (UINT64)con_cols * con_rows;
@@ -661,16 +645,8 @@ static void console_buffer_init(void)
     fb_fill(bg_color);
     cur_x = cur_y = 0;
 }
-BOOLEAN kernel_console_buffered(void)
-{
-    return con_cells != NULL;
-}
-BOOLEAN kernel_fb_pat_wc(void)
-{
-    return fb_pat_wc;
-}
-
-// Kernel console driver API (see kernel.h)
+BOOLEAN kernel_console_buffered(void) { return con_cells != NULL; }
+BOOLEAN kernel_fb_pat_wc(void) { return fb_pat_wc; }
 
 void kernel_fb_init(UINT32 *fb_base_in, UINT32 width, UINT32 height, UINT32 pitch, UINT8 rshift,
                     UINT8 gshift, UINT8 bshift)
@@ -689,22 +665,10 @@ void kernel_fb_init(UINT32 *fb_base_in, UINT32 width, UINT32 height, UINT32 pitc
     cur_y = 0;
 }
 
-UINT32 kernel_fb_width(void)
-{
-    return fb_width;
-}
-UINT32 kernel_fb_height(void)
-{
-    return fb_height;
-}
-UINT32 kernel_con_cols(void)
-{
-    return con_cols;
-}
-UINT32 kernel_con_rows(void)
-{
-    return con_rows;
-}
+UINT32 kernel_fb_width(void) { return fb_width; }
+UINT32 kernel_fb_height(void) { return fb_height; }
+UINT32 kernel_con_cols(void) { return con_cols; }
+UINT32 kernel_con_rows(void) { return con_rows; }
 
 void kernel_console_clear(void)
 {
@@ -720,7 +684,6 @@ void kernel_console_clear(void)
     console_leave(locked);
 }
 
-/* Generic console viewport and overlay mechanisms; input policy is external. */
 UINT32 kernel_console_scroll(INT32 rows)
 {
     BOOLEAN locked = console_enter();
@@ -756,8 +719,6 @@ void kernel_overlay_move(INT32 x, INT32 y)
     fb_overlay.y = y < 0 ? 0 : y >= (INT32)fb_height ? (INT32)fb_height - 1 : y;
     console_leave(locked);
 }
-
-// Text console.
 
 static void con_putc_raw(char c)
 {
@@ -859,26 +820,15 @@ void con_print_int(INT32 v)
     }
 }
 
-/* Physical allocator: a page must have both EFI eligibility and current
- * ownership before it can be returned. Low 1 MiB and all loader/firmware
- * allocations remain reserved; no boot-services memory is reclaimed. */
+/* PMM returns only EFI-eligible pages it currently owns; low memory and firmware allocations stay reserved. */
 static UINT8 page_bitmap[PMM_MAX_PAGES / 8], eligible_bitmap[PMM_MAX_PAGES / 8];
 static UINT64 pmm_free_pages, pmm_total_pages_managed, pmm_search_cursor, pmm_high_page;
 static EFI_MEMORY_DESCRIPTOR *boot_map;
 static UINTN boot_desc_size, boot_entries;
 static UINT64 *kernel_pml4;
-static BOOLEAN bit_get(UINT8 *b, UINT64 n)
-{
-    return (b[n >> 3] >> (n & 7)) & 1;
-}
-static void bit_set(UINT8 *b, UINT64 n)
-{
-    b[n >> 3] |= (UINT8)(1u << (n & 7));
-}
-static void bit_clear(UINT8 *b, UINT64 n)
-{
-    b[n >> 3] &= (UINT8) ~(1u << (n & 7));
-}
+static BOOLEAN bit_get(UINT8 *b, UINT64 n) { return (b[n >> 3] >> (n & 7)) & 1; }
+static void bit_set(UINT8 *b, UINT64 n) { b[n >> 3] |= (UINT8)(1u << (n & 7)); }
+static void bit_clear(UINT8 *b, UINT64 n) { b[n >> 3] &= (UINT8) ~(1u << (n & 7)); }
 void pmm_seed_from_efi_map(EFI_MEMORY_DESCRIPTOR *map, UINTN stride, UINTN count)
 {
     if (scheduler_ready || !map || stride < sizeof(*map))
@@ -943,10 +893,7 @@ UINT64 k_pmm_alloc_pages(UINT32 count, UINT64 maximum)
     k_spin_unlock(&pmm_lock, f);
     return 0;
 }
-UINT64 pmm_alloc_page(void)
-{
-    return k_pmm_alloc_pages(1, 0);
-}
+UINT64 pmm_alloc_page(void) { return k_pmm_alloc_pages(1, 0); }
 void k_pmm_free_pages(UINT64 phys, UINT32 count)
 {
     if (!count || (phys & 4095) || phys / 4096 >= PMM_MAX_PAGES ||
@@ -965,32 +912,13 @@ void k_pmm_free_pages(UINT64 phys, UINT32 count)
         pmm_search_cursor = start;
     k_spin_unlock(&pmm_lock, f);
 }
-void pmm_free_page(UINT64 phys)
-{
-    k_pmm_free_pages(phys, 1);
-}
-UINT64 k_pmm_free_count(void)
-{
-    return __atomic_load_n(&pmm_free_pages, __ATOMIC_RELAXED);
-}
-UINT64 kernel_pmm_managed_mib(void)
-{
-    return pmm_total_pages_managed / 256;
-}
-UINT64 kernel_pmm_free_mib(void)
-{
-    return k_pmm_free_count() / 256;
-}
-UINT64 kernel_pmm_used_mib(void)
-{
-    return (pmm_total_pages_managed - k_pmm_free_count()) / 256;
-}
-static BOOLEAN canonical(UINT64 a)
-{
-    return (a >> 47) == 0 || (a >> 47) == 0x1ffff;
-}
-/* Split a large mapping before descending. PAT's large-page bit (12) is
- * moved to bit 7 for 4 KiB leaves. No allocation failure is dereferenced. */
+void pmm_free_page(UINT64 phys) { k_pmm_free_pages(phys, 1); }
+UINT64 k_pmm_free_count(void) { return __atomic_load_n(&pmm_free_pages, __ATOMIC_RELAXED); }
+UINT64 kernel_pmm_managed_mib(void) { return pmm_total_pages_managed / 256; }
+UINT64 kernel_pmm_free_mib(void) { return k_pmm_free_count() / 256; }
+UINT64 kernel_pmm_used_mib(void) { return (pmm_total_pages_managed - k_pmm_free_count()) / 256; }
+static BOOLEAN canonical(UINT64 a) { return (a >> 47) == 0 || (a >> 47) == 0x1ffff; }
+/* Split large mappings before descent; translate PAT bit 12 to 4 KiB PAT bit 7. */
 static int pt_child(UINT64 *table, UINT32 idx, UINT32 level, BOOLEAN user, UINT64 **out)
 {
     UINT64 e = table[idx];
@@ -1027,7 +955,8 @@ static int map_page_raw(UINT64 *root, UINT64 v, UINT64 p, UINT64 flags, BOOLEAN 
     if (!root || !canonical(v) || ((v | p) & 4095) || (p & ~PHYS_MASK))
         return K_EINVAL;
     BOOLEAN user = (flags & PAGE_USER) != 0;
-    if (user && (v < K_USER_BASE || v >= K_USER_LIMIT))
+    if (user && (v < 0x10000 || v >= K_USER_CANON_LIMIT ||
+                 (kernel_pml4 && (kernel_pml4[v >> 39] & PAGE_PRESENT))))
         return K_EPERM;
     UINT64 *t = root;
     for (UINT32 level = 4; level > 1; --level) {
@@ -1045,8 +974,7 @@ static int map_page_raw(UINT64 *root, UINT64 v, UINT64 p, UINT64 flags, BOOLEAN 
 }
 int vmm_map_page(UINT64 *root, UINT64 v, UINT64 p, UINT64 flags)
 {
-    /* Kernel mappings are immutable once APs run: no hidden TLB-shootdown gap.
-     * User mappings are private and all user tasks are pinned to the BSP. */
+    /* Kernel mappings freeze once APs run; user mappings stay private to fixed-affinity processes. */
     if ((smp_started && root == kernel_pml4) || (flags & PAGE_USER))
         return K_EPERM;
     UINT64 f = k_spin_lock(&vm_lock);
@@ -1210,10 +1138,8 @@ int kernel_vmm_init(void)
             m->PhysicalStart >= K_USER_BASE)
             continue;
         UINT64 flags = PAGE_RW;
-        /* UEFI Attribute is a mask of SUPPORTED cache modes, not a selected
-         * mode. UC|WC|WT|WB is normal RAM: choosing UC there uncaches kernel
-         * stacks, spinlocks and scheduler data on every core. Prefer WB.
-         * UEFI GetMemoryMap(), EFI_MEMORY_DESCRIPTOR.Attribute. */
+        /* EFI memory attributes advertise supported cache modes, not one selected mode.
+ * Prefer WB for ordinary RAM; UC there would uncache kernel data on every CPU. */
         UINT64 cache_caps =
             m->Attribute & (EFI_MEMORY_UC | EFI_MEMORY_WC | EFI_MEMORY_WT | EFI_MEMORY_WB);
         BOOLEAN ordinary_ram = m->Type == EfiConventionalMemory || m->Type == EfiLoaderCode ||
@@ -1225,8 +1151,7 @@ int kernel_vmm_init(void)
         if (m->Type == EfiMemoryMappedIO ||
             (!(cache_caps & EFI_MEMORY_WB) && !(ordinary_ram && !cache_caps)))
             flags |= PAGE_PCD | PAGE_PWT;
-        /* Preserve executable firmware/loader descriptors; supervisor-only.
-         * Conventional RAM and MMIO need no executable identity alias. */
+        /* Firmware/loader code keeps executable supervisor identity mappings. */
         if (platform.nx && m->Type != EfiLoaderCode && m->Type != EfiBootServicesCode &&
             m->Type != EfiRuntimeServicesCode && m->Type != EfiReservedMemoryType)
             flags |= PAGE_NX;
@@ -1234,29 +1159,25 @@ int kernel_vmm_init(void)
         if (e)
             return e;
     }
-    /* Framebuffer aperture may be absent from the EFI memory map. */
+    /* Framebuffer may be absent from the EFI memory map. */
     if (fb_base) {
         int e = map_identity((UINT64)(UINTN)fb_base, (UINT64)fb_pitch * fb_height * 4,
                              PAGE_RW | PAGE_PCD | PAGE_PWT | (platform.nx ? PAGE_NX : 0));
         if (e)
             return e;
     }
-    /* Pre-create a private diagnostic slot before cloning any address space. */
+
     UINT64 *ignored;
     int e = pt_child(kernel_pml4, (K_TEST_VA >> 39) & 511, 4, FALSE, &ignored);
     if (e)
         return e;
-    /* Flush while the firmware cache types are still in force. Change cache
-     * policy with interrupts and caching disabled; retain firmware MTRRs.
-     * No AP has been started yet. This avoids WB/UC aliases during CR3/PAT
-     * handoff, including dirty cache lines inherited from the EFI loader. */
+    /* Change cache policy with interrupts/caching disabled before AP start to avoid WB/UC aliases. */
     UINT64 irq = k_irq_save(), cr0;
     __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
     cr0 = (cr0 | (1ULL << 16)) & ~((1ULL << 30) | (1ULL << 29));
     UINT64 uncached_cr0 = cr0 | (1ULL << 30);
     __asm__ volatile("mov %0,%%cr0; wbinvd" ::"r"(uncached_cr0) : "memory");
-    /* Drop firmware PCID/global translations before enabling isolation.
-     * None of this kernel's leaves use GLOBAL. */
+    /* Drop inherited PCID/global translations before enabling isolation. */
     if (cr4 & (1ULL << 17)) {
         UINT64 old_cr3;
         __asm__ volatile("mov %%cr3,%0" : "=r"(old_cr3));
@@ -1267,15 +1188,13 @@ int kernel_vmm_init(void)
     __asm__ volatile("mov %0,%%cr4" ::"r"(cr4) : "memory");
     __asm__ volatile("mov %0,%%cr3" ::"r"(kernel_pml4) : "memory");
     vm_ready = TRUE;
-    /* Entry 0 stays WB for RAM/page tables; entry 3 stays strong UC for
-     * registers. Entry 1 was unused by our tables and becomes WC only for
-     * the framebuffer aperture. ap_cache_init() installs this PAT on APs. */
+    /* PAT[0]=WB, PAT[3]=UC, PAT[1]=WC for the framebuffer. */
     if (has_pat && fb_base) {
         saved_pat = (saved_pat & ~(255ULL << 8)) | (1ULL << 8);
         wrmsr(0x277, saved_pat);
         e = map_identity((UINT64)(UINTN)fb_base, (UINT64)fb_pitch * fb_height * 4,
                          PAGE_RW | PAGE_PWT | (platform.nx ? PAGE_NX : 0));
-        fb_pat_wc = !e; /* MTRRs may still impose a more restrictive type. */
+        fb_pat_wc = !e; /* MTRRs may still impose a stricter type. */
     }
     __asm__ volatile("wbinvd; mov %0,%%cr3" ::"r"(kernel_pml4) : "memory");
     __asm__ volatile("mov %0,%%cr0" ::"r"(cr0) : "memory");
@@ -1285,15 +1204,10 @@ int kernel_vmm_init(void)
     console_buffer_init();
     return 0;
 }
-UINT64 *kernel_get_pml4(void)
-{
-    return kernel_pml4;
-}
+UINT64 *kernel_get_pml4(void) { return kernel_pml4; }
 
 k_address_space *k_as_create(void)
 {
-    if (k_cpu_id() != 0)
-        return NULL;
     UINT64 f = k_spin_lock(&vm_lock);
     for (UINT32 i = 0; i < MAX_AS; ++i)
         if (!spaces[i].used) {
@@ -1302,7 +1216,8 @@ k_address_space *k_as_create(void)
                 break;
             mem_copy(p, kernel_pml4, 4096);
             p[USER_SLOT] = 0;
-            spaces[i] = (k_address_space){TRUE, p, K_USER_BASE + 0x200000, 0, NULL};
+            spaces[i] = (k_address_space){.used = TRUE, .pml4 = p, .next = K_USER_BASE + 0x200000};
+            spaces[i].private_slots[USER_SLOT / 64] |= 1ULL << (USER_SLOT % 64);
             k_spin_unlock(&vm_lock, f);
             return &spaces[i];
         }
@@ -1326,10 +1241,10 @@ static void free_user_tree(UINT64 *table, UINT32 level)
 }
 int k_as_destroy(k_address_space *as)
 {
-    if (!valid_as(as) || k_cpu_id() != 0)
+    if (!valid_as(as))
         return K_EINVAL;
     if (as->owner)
-        return K_EBUSY; /* process-owned spaces are borrowed handles */
+        return K_EBUSY;
     UINT64 f = k_spin_lock(&sched_lock);
     for (UINT32 i = 0; i < K_MAX_TASKS; ++i)
         if (tasks[i].state != K_TASK_UNUSED && tasks[i].state != K_TASK_ZOMBIE &&
@@ -1339,11 +1254,13 @@ int k_as_destroy(k_address_space *as)
         }
     k_spin_unlock(&sched_lock, f);
     f = k_spin_lock(&vm_lock);
-    if (as->pml4[USER_SLOT] & PAGE_PRESENT) {
-        UINT64 p = as->pml4[USER_SLOT] & PHYS_MASK;
-        free_user_tree((void *)(UINTN)p, 3);
-        pmm_free_page(p);
-    }
+    for (UINT32 slot = 0; slot < 256; ++slot)
+        if ((as->private_slots[slot / 64] & (1ULL << (slot % 64))) &&
+            (as->pml4[slot] & PAGE_PRESENT)) {
+            UINT64 p = as->pml4[slot] & PHYS_MASK;
+            free_user_tree((void *)(UINTN)p, 3);
+            pmm_free_page(p);
+        }
     pmm_free_page((UINT64)(UINTN)as->pml4);
     mem_zero(as, sizeof(*as));
     k_spin_unlock(&vm_lock, f);
@@ -1353,8 +1270,7 @@ int k_as_alloc(k_address_space *as, UINT64 bytes, UINT64 align, UINT32 rwx, UINT
 {
     if (!valid_as(as) || !base || !bytes || !power2(align) || align > 0x40000000 || (rwx & ~7) ||
         !(rwx & RIEF_REGION_R) ||
-        ((rwx & (RIEF_REGION_W | RIEF_REGION_X)) == (RIEF_REGION_W | RIEF_REGION_X)) ||
-        k_cpu_id() != 0)
+        ((rwx & (RIEF_REGION_W | RIEF_REGION_X)) == (RIEF_REGION_W | RIEF_REGION_X)))
         return K_EINVAL;
     if (!platform.nx)
         return K_ENOTSUP;
@@ -1402,8 +1318,8 @@ int k_as_alloc(k_address_space *as, UINT64 bytes, UINT64 align, UINT32 rwx, UINT
 }
 int k_as_check(k_address_space *as, UINT64 address, UINT64 bytes, BOOLEAN write)
 {
-    if (!valid_as(as) || address < K_USER_BASE || address >= K_USER_LIMIT ||
-        bytes > K_USER_LIMIT - address)
+    if (!valid_as(as) || address < 0x10000 || address >= K_USER_CANON_LIMIT ||
+        bytes > K_USER_CANON_LIMIT - address)
         return K_EFAULT;
     if (!bytes)
         return 0;
@@ -1416,8 +1332,7 @@ int k_as_check(k_address_space *as, UINT64 address, UINT64 bytes, BOOLEAN write)
     }
     return 0;
 }
-/* Copies via supervisor physical aliases. No temporary permissions on user
- * mappings, and no direct dereference of an untrusted virtual pointer. */
+/* User copies use supervisor physical aliases; untrusted VAs are never dereferenced directly. */
 static int as_copy(k_address_space *as, UINT64 u, void *buf, UINT64 n, BOOLEAN to, BOOLEAN loader)
 {
     int e = k_as_check(as, u, n, to && !loader);
@@ -1449,7 +1364,7 @@ int k_copy_from_user(k_address_space *as, void *b, UINT64 u, UINT64 n)
     return as_copy(as, u, b, n, FALSE, FALSE);
 }
 
-/* ACPI discovery is checksum/length checked before any table is interpreted. */
+/* Validate ACPI length/checksum before interpreting a table. */
 static volatile UINT8 *hpet;
 static UINT64 hpet_period_fs, hpet_mask = ~0ULL;
 static UINT16 pm_timer_port;
@@ -1592,7 +1507,7 @@ static void parse_hpet(const UINT8 *t)
     hpet = base;
     hpet_period_fs = period;
     hpet_mask = (caps & (1 << 13)) ? ~0ULL : 0xffffffffULL;
-    /* Main counter only; do not enable legacy replacement or comparator IRQs. */
+    /* HPET main counter only; no legacy replacement/comparator IRQs. */
     UINT64 cfg = *(volatile UINT64 *)(hpet + 0x10);
     *(volatile UINT64 *)(hpet + 0x10) = (cfg & ~2ULL) | 1;
     UINT64 before = *(volatile UINT64 *)(hpet + 0xf0);
@@ -1738,10 +1653,7 @@ int k_platform_init(UINT64 rsdp, UINT64 trampoline)
     }
     return 0;
 }
-const k_platform_info *k_platform(void)
-{
-    return &platform;
-}
+const k_platform_info *k_platform(void) { return &platform; }
 static UINT32 lapic_read(UINT32 off)
 {
     return platform.x2apic ? (UINT32)rdmsr(0x800 + (off >> 4))
@@ -1771,8 +1683,7 @@ UINT32 k_cpu_id(void)
             return i;
     return 0;
 }
-/* All wait paths have both a clock deadline and a finite iteration bound.
- * The PIT fallback uses channel 2, never the scheduler's channel 0. */
+/* Hardware waits have both a time deadline and finite iteration bound. */
 static int pit_delay(UINT32 us)
 {
     if (!platform.pic)
@@ -1897,19 +1808,13 @@ int k_timer_init(UINT32 hz)
     platform.timer_source = "unavailable";
     return K_ENOTSUP;
 }
-UINT64 k_ticks(void)
-{
-    return __atomic_load_n(&global_ticks, __ATOMIC_RELAXED);
-}
+UINT64 k_ticks(void) { return __atomic_load_n(&global_ticks, __ATOMIC_RELAXED); }
 UINT64 k_uptime_ms(void)
 {
     UINT64 t = k_ticks();
     return (t / timer_hz) * 1000 + (t % timer_hz) * 1000 / timer_hz;
 }
-UINT32 k_tick_hz(void)
-{
-    return timer_hz;
-}
+UINT32 k_tick_hz(void) { return timer_hz; }
 int k_cpu_get(UINT32 i, k_cpu_info *out)
 {
     if (!out || i >= platform.discovered_cpus)
@@ -1923,9 +1828,9 @@ int k_cpu_get(UINT32 i, k_cpu_info *out)
     return 0;
 }
 
-/* A vector-specific error-code-normalized frame for every IDT entry.
- * In 64-bit mode, the CPU pushes SS:RSP even without a CPL change.
- * C calls receive Microsoft ABI shadow space on a 16-byte aligned stack. */
+/* IDT stubs normalize error-code frames.
+ * In 64-bit mode the CPU pushes SS:RSP even without a CPL change.
+ * C calls use Microsoft ABI shadow space on a 16-byte aligned stack. */
 extern void *irq_stubs[256];
 extern void syscall_entry(void);
 irq_frame *irq_dispatch(irq_frame *);
@@ -1946,9 +1851,7 @@ __asm__(
     "pushq %r8\npushq %r9\npushq %r10\npushq %r11\npushq %r12\npushq %r13\npushq %r14\npushq %r15\n"
     "cld\nmovq %rsp,%rcx\nandq $-16,%rsp\nsubq $32,%rsp\ncall irq_dispatch\n"
     "movq %rax,%rsp\n"
-    /* Publish stack ownership only after RSP has changed. A remote reaper may
-     * now release the old stack. NMI may interrupt a SWAPGS window and never
-     * schedules a healthy task; its return must not dereference GS. */
+    /* Publish stack ownership only after RSP changes so a remote reaper cannot free the live stack. */
     "cmpq $2,120(%rsp)\nje 3f\nmovq %gs:24,%rax\nmovq %rax,%gs:16\n3:\n"
     "popq %r15\npopq %r14\npopq %r13\npopq %r12\npopq %r11\npopq %r10\npopq %r9\npopq %r8\n"
     "popq %rdi\npopq %rsi\npopq %rbp\npopq %rdx\npopq %rcx\npopq %rbx\npopq %rax\n"
@@ -1990,8 +1893,7 @@ static void cpu_tables(cpu_state *cpu)
     cr0 = (cr0 & ~((1ULL << 2) | (1ULL << 3))) | (1 << 1) | (1 << 16);
     __asm__ volatile("mov %0,%%cr0" ::"r"(cr0) : "memory");
     __asm__ volatile("mov %%cr4,%0" : "=r"(cr4));
-    /* SSE/x87 are saved eagerly. Disable unsaved AVX, FSGSBASE and debug
-     * extensions inherited from firmware; user cannot replace kernel GS. */
+    /* x87/SSE are saved eagerly; disable unsaved AVX/FSGSBASE/debug extensions. */
     cr4 &= ~((1ULL << 18) | (1ULL << 16) | (1ULL << 11) | (1ULL << 21));
     cr4 |= (1 << 9) | (1 << 10);
     if (platform.smep)
@@ -2007,7 +1909,7 @@ static void cpu_tables(cpu_state *cpu)
     UINT32 a, b, c, d;
     cpuid(1, 0, &a, &b, &c, &d);
     if (d & (1 << 11))
-        wrmsr(0x174, 0); /* unconfigured SYSENTER must fault in ring 3 */
+        wrmsr(0x174, 0); /* Unconfigured SYSENTER must fault from ring 3. */
 }
 void kernel_interrupts_init(void)
 {
@@ -2059,14 +1961,11 @@ void kernel_interrupts_init(void)
                 }
         }
     } else if (platform.ps2 && platform.pic) {
-        outb(0x21, 0xf9); /* first port plus slave-PIC cascade */
-        outb(0xa1, 0xef); /* second port IRQ12 */
+        outb(0x21, 0xf9);
+        outb(0xa1, 0xef);
     }
 }
-void kernel_interrupts_enable(void)
-{
-    __asm__ volatile("sti" ::: "memory");
-}
+void kernel_interrupts_enable(void) { __asm__ volatile("sti" ::: "memory"); }
 
 static void pic_eoi(UINT32 v)
 {
@@ -2090,9 +1989,26 @@ static irq_frame *irq_dispatch_inner(irq_frame *f)
 {
     UINT32 v = (UINT32)f->vector, c = k_cpu_id();
     if (v == 2)
-        return f; /* NMI uses a private IST and does not touch scheduler locks */
+        return f; /* NMI uses a private IST and never takes scheduler locks. */
+    if (v != 8 && v != 18 && (f->cs & 3) == 3 && cpus[c].current && cpus[c].current->process &&
+        cpus[c].current->control_request && process_return_control(cpus[c].current)) {
+        if (v == 0xf0 || (v == 0x20 && pic_timer)) {
+            ++cpus[c].ticks;
+            if (c == 0)
+                __atomic_add_fetch(&global_ticks, 1, __ATOMIC_RELAXED);
+        }
+        /* Acknowledge the interrupt before abandoning the user frame. */
+        if (v >= 0x20 && v < 0x30) {
+            if (platform.apic && !pic_timer)
+                lapic_eoi();
+            else
+                pic_eoi(v);
+        } else if (v >= 0x20 && v != 128 && v != 129 && v != 0xff && platform.apic)
+            lapic_eoi();
+        return schedule(f, TRUE);
+    }
     if (v == 0xff)
-        return f; /* architectural spurious APIC vector has no EOI */
+        return f;
     if (v < 32) {
         UINT64 cr2;
         __asm__ volatile("mov %%cr2,%0" : "=r"(cr2));
@@ -2169,13 +2085,16 @@ static irq_frame *irq_dispatch_inner(irq_frame *f)
 irq_frame *irq_dispatch(irq_frame *f)
 {
     irq_frame *r = irq_dispatch_inner(f);
-    /* User-controlled RSP and NT must not turn IRET into a ring-0 #GP.
-     * This also covers a timer interrupt after an application corrupts RSP. */
+    /* Validate user IRET state so a corrupt RSP/NT cannot turn return into a ring-0 #GP. */
     while ((r->cs & 3) == 3) {
         task *t = current_task();
-        BOOLEAN bad = r->cs != 0x23 || r->ss != 0x1b || r->rsp < K_USER_BASE ||
-                      r->rsp >= K_USER_LIMIT || r->rip < K_USER_BASE || r->rip >= K_USER_LIMIT ||
-                      !t || !t->process;
+        if (t && t->process && process_return_control(t)) {
+            r = schedule(r, TRUE);
+            continue;
+        }
+        BOOLEAN bad = r->cs != 0x23 || r->ss != 0x1b || r->rsp < 0x10000 ||
+                      r->rsp >= K_USER_CANON_LIMIT || r->rip < 0x10000 ||
+                      r->rip >= K_USER_CANON_LIMIT || !t || !t->process;
         if (!bad) {
             r->rflags = (r->rflags & 0x250dd5ULL) |
                         0x202;
@@ -2198,10 +2117,7 @@ irq_frame *irq_dispatch(irq_frame *f)
     return r;
 }
 
-static task *current_task(void)
-{
-    return cpus[k_cpu_id()].current;
-}
+static task *current_task(void) { return cpus[k_cpu_id()].current; }
 UINT32 k_task_id(void)
 {
     task *t = current_task();
@@ -2310,7 +2226,7 @@ int k_scheduler_init(void)
     boot->cpu = 0;
     boot->weight = 1024;
     boot->state = K_TASK_RUNNING;
-    str_copy(boot->name, "shell", sizeof(boot->name));
+    str_copy(boot->name, "boot", sizeof(boot->name));
     mem_copy(boot->fx, initial_fx, sizeof(boot->fx));
     cpus[0].current = boot;
     cpus[0].stack_owner = boot;
@@ -2341,9 +2257,7 @@ static irq_frame *schedule(irq_frame *frame, BOOLEAN forced)
     task *old = cpu->current;
     if (!forced && old && old->idle) {
         ++cpu->idle_ticks;
-        /* An empty CPU stays in HLT without taking the global lock or
-         * scanning all tasks at every timer interrupt. A producer publishes
-         * work_pending under sched_lock; the next local tick sees it. */
+        /* Idle CPUs avoid the global scheduler lock until work_pending is published. */
         if (!__atomic_load_n(&cpu->work_pending, __ATOMIC_ACQUIRE)) {
             ++old->runtime;
             return frame;
@@ -2408,6 +2322,8 @@ static irq_frame *schedule(irq_frame *frame, BOOLEAN forced)
     if (!cpu->slice)
         cpu->slice = 1;
     if (best != old) {
+        old->fs_base = rdmsr(0xc0000100);
+        wrmsr(0xc0000100, best->fs_base);
         __asm__ volatile("fxsave64 %0" : "=m"(old->fx)::"memory");
         __asm__ volatile("fxrstor64 %0" ::"m"(best->fx) : "memory");
         cpu->current = best;
@@ -2438,7 +2354,7 @@ void k_sleep(UINT64 ms)
     task *t = current_task();
     if (!t || t->preempt_depth)
         return;
-    /* Saturate and round upward without multiplying an untrusted u64. */
+    /* Round untrusted u64 sizes without overflow. */
     if (ms > 86400000ULL)
         ms = 86400000ULL;
     UINT64 ticks = (ms * timer_hz + 999) / 1000;
@@ -2492,7 +2408,7 @@ int k_task_reap(UINT32 id, INT32 *exit)
             if (t->process) {
                 k_spin_unlock(&sched_lock, f);
                 return K_EPERM;
-            } /* process owns its task */
+            }
             if (exit)
                 *exit = t->exit_code;
             free_task(t);
@@ -2535,8 +2451,7 @@ int k_task_query(UINT32 id, k_task_info *out)
     k_spin_unlock(&sched_lock, f);
     return e;
 }
-/* Blocking and wakeup use the same scheduler lock as the ownership test:
- * the unlock-before-sleep race cannot lose a wakeup. */
+/* Sleep and wake share sched_lock so unlock-before-sleep cannot lose a wakeup. */
 static void wake_object(void *obj)
 {
     for (UINT32 i = 0; i < K_MAX_TASKS; ++i)
@@ -2716,8 +2631,7 @@ int k_ipc_grant(UINT32 pid, UINT32 target)
     return K_ENOENT;
 }
 
-/* INIT/SIPI bootstrap. Every absolute value in this blob is patched after
- * copying it to an EFI-reserved page. It never assumes address 0x7000 is free. */
+/* INIT/SIPI trampoline is copied into an EFI-reserved low page and patched in place. */
 extern UINT8 ap_blob[], ap_blob_end[], ap_gdtr[], ap_gdt[], ap_base[], ap_pm_far[], ap_lm_far[];
 extern UINT8 ap_cr3[], ap_stack[], ap_entry[], ap_argument[], ap_efer[], ap_pm[], ap_lm[];
 __asm__(".text\n.balign 16\n.globl ap_blob\nap_blob:\n.code16\ncli\ncld\n"
@@ -2840,7 +2754,7 @@ int k_smp_start(void)
     if (!platform.apic || !lapic_period || pic_timer || !ap_trampoline || (ap_trampoline & 4095) ||
         ap_trampoline >= 0x100000 || ap_blob_end - ap_blob > 4096)
         return K_ENOTSUP;
-    /* Make the trampoline executable, before kernel page tables become fixed. */
+    /* Make the trampoline executable before kernel mappings freeze. */
     int e = map_identity(ap_trampoline, 4096, PAGE_RW);
     if (e)
         return e;
@@ -2885,8 +2799,7 @@ int k_smp_start(void)
              ++j)
             e = delay_checked(1000);
         if (e || !__atomic_load_n(&cpus[i].online, __ATOMIC_ACQUIRE)) {
-            /* Do not reuse the shared handoff page after a late/failed AP.
-             * Keep its stack allocated; request INIT and stop starting APs. */
+            /* After a late/failed AP, keep its handoff page/stack reserved and stop starting APs. */
             (void)send_ipi(target, 0xc500);
             return e ? e : K_ETIMEDOUT;
         }
@@ -2895,8 +2808,7 @@ int k_smp_start(void)
     return 0;
 }
 
-/* Segment-zero PCI configuration mechanism #1, shared by storage and input.
- * Only command-register bits are changed; status W1C bits are never echoed. */
+/* PCI config mechanism #1; never echo status W1C bits while changing command bits. */
 static k_spinlock pci_lock = K_SPINLOCK_INIT;
 static UINT32 pci_read_32(UINT8 bus, UINT8 slot, UINT8 func, UINT8 off)
 {
@@ -2962,7 +2874,7 @@ typedef struct {
     UINT32 kind, controller, nsid, port;
     k_disk_info info;
     UINT8 *ram;
-    UINT8 flush_command; /* zero: persistent writes unavailable */
+    UINT8 flush_command;
 } disk;
 static disk disks[K_MAX_DISKS];
 static UINT32 disk_count;
@@ -2985,7 +2897,6 @@ static disk *disk_add(UINT32 kind, UINT32 sector_size, UINT64 sectors, const cha
     str_copy(d->info.model, model, sizeof(d->info.model));
     str_copy(d->info.driver, driver, sizeof(d->info.driver));
     decimal_name(d->info.name, "disk", disk_count);
-    ++disk_count;
     return d;
 }
 static void trim_model(char *m)
@@ -3023,8 +2934,7 @@ static int ata_identity(const UINT8 *id, UINT32 *sector, UINT64 *count, char mod
     return 0;
 }
 
-/* NVMe: one admin and one I/O queue pair per controller. All buffers are
- * pinned 4 KiB pages; I/O uses one PRP, so no PRP-list boundary ambiguity. */
+/* NVMe uses one admin and one I/O queue pair; DMA buffers are pinned 4 KiB pages. */
 #define NVME_DEPTH 32
 typedef struct {
     volatile UINT32 dw[16];
@@ -3053,8 +2963,8 @@ static UINT32 nvme_count;
 static void nvme_dead(nvme_controller *n)
 {
     n->dead = TRUE;
-    pci_command(n->bdf, 0, 4); /* stop DMA; never recycle pinned pages */
-    for (UINT32 i = 0; i < disk_count; ++i)
+    pci_command(n->bdf, 0, 4); /* After a DMA failure, pinned pages are not recycled. */
+    for (UINT32 i = 0; i < k_disk_count(); ++i)
         if (disks[i].kind == DISK_NVME && &nvme[disks[i].controller] == n)
             disks[i].info.online = FALSE;
 }
@@ -3130,7 +3040,7 @@ static int nvme_probe(UINT16 bdf)
     UINT64 base = pci_mbar(bdf, 0x10);
     if (!base || k_mmio_map(base, 8192))
         return K_ENOTSUP;
-    pci_command(bdf, 2, 4); /* MMIO on, DMA off during ownership setup */
+    pci_command(bdf, 2, 4);
     nvme_controller *n = &nvme[nvme_count];
     mem_zero(n, sizeof(*n));
     n->bdf = bdf;
@@ -3144,7 +3054,7 @@ static int nvme_probe(UINT16 bdf)
     n->timeout_ms = (UINT32)((cap >> 24) & 255) * 500;
     if (n->timeout_ms < 5000)
         n->timeout_ms = 5000;
-    *(volatile UINT32 *)(n->regs + 0x0c) = 0xffffffff; /* mask all interrupts; polling queues */
+    *(volatile UINT32 *)(n->regs + 0x0c) = 0xffffffff;
     *(volatile UINT32 *)(n->regs + 0x14) &= ~1U;
     if (!wait_reg((void *)(n->regs + 0x1c), 1, 0, n->timeout_ms))
         return K_ETIMEDOUT;
@@ -3212,7 +3122,7 @@ static int nvme_probe(UINT16 bdf)
             ids[count++] = id;
         }
     } else if (!n->dead) {
-        /* NVMe 1.0 lacks CNS=2. Query a bounded set of namespace IDs. */
+
         for (UINT32 i = 1; i <= namespace_count && count < K_MAX_DISKS; ++i)
             ids[count++] = i;
     }
@@ -3231,7 +3141,8 @@ static int nvme_probe(UINT16 bdf)
         if (d) {
             d->controller = nvme_count - 1;
             d->nsid = ids[i];
-            d->flush_command = 1; /* NVMe Flush capability sentinel */
+            d->flush_command = 1;
+            __atomic_add_fetch(&disk_count, 1, __ATOMIC_RELEASE);
         }
     }
     return n->dead ? K_EIO : 0;
@@ -3261,9 +3172,7 @@ static int nvme_read(disk *d, UINT64 lba, UINT32 count, void *out)
     return 0;
 }
 
-/* AHCI ports have independent command lists/FIS areas/tables/bounce buffers.
- * Slot zero is used only after the firmware engine has stopped and no old
- * command remains. A failed DMA path is quarantined for the rest of the boot. */
+/* AHCI ports use private command/FIS/table/bounce buffers; failed DMA paths are quarantined. */
 typedef struct {
     UINT16 bdf;
     volatile UINT8 *port;
@@ -3279,7 +3188,7 @@ static void ahci_dead(ahci_port *a)
     for (UINT32 i = 0; i < ahci_count; ++i)
         if (ahci[i].bdf == a->bdf)
             ahci[i].dead = TRUE;
-    for (UINT32 i = 0; i < disk_count; ++i)
+    for (UINT32 i = 0; i < k_disk_count(); ++i)
         if (disks[i].kind == DISK_AHCI && ahci[disks[i].controller].bdf == a->bdf)
             disks[i].info.online = FALSE;
 }
@@ -3414,6 +3323,7 @@ static int ahci_probe(UINT16 bdf)
                 d->flush_command = (a->lba48 && (caps & 0x2000)) ? 0xea
                                    : (caps & 0x1000)             ? 0xe7
                                                                  : 0;
+            __atomic_add_fetch(&disk_count, 1, __ATOMIC_RELEASE);
         }
     }
     return 0;
@@ -3436,8 +3346,7 @@ static int ahci_read(disk *d, UINT64 lba, UINT32 count, void *out)
     return 0;
 }
 
-/* Legacy ATA PIO is discovered through PCI IDE functions, not blind probing
- * arbitrary embedded I/O ports. Native and compatibility channels both work. */
+/* IDE PIO is discovered through PCI functions, not blind I/O-port probing. */
 typedef struct {
     UINT16 base, control;
     UINT8 slave;
@@ -3447,12 +3356,11 @@ static ata_device ata[16];
 static UINT32 ata_count;
 static void ata_quarantine(ata_device *a)
 {
-    /* Both devices share the command/status registers. A timed-out command
-     * makes the entire channel unusable until an explicit future recovery. */
+    /* A timed-out ATA command quarantines the shared channel. */
     for (UINT32 i = 0; i < ata_count; ++i)
         if (ata[i].base == a->base)
             ata[i].dead = TRUE;
-    for (UINT32 i = 0; i < disk_count; ++i)
+    for (UINT32 i = 0; i < k_disk_count(); ++i)
         if (disks[i].kind == DISK_ATA && ata[disks[i].controller].base == a->base)
             disks[i].info.online = FALSE;
 }
@@ -3484,7 +3392,7 @@ static int ata_probe_channel(UINT16 base, UINT16 control)
         return K_EINVAL;
     for (UINT8 slave = 0; slave < 2 && ata_count < ARRAY_LEN(ata); ++slave) {
         ata_device a = {base, control, slave, FALSE, FALSE};
-        outb(control, 2); /* nIEN: polled PIO, no bus-master engine */
+        outb(control, 2);
         outb(base + 6, 0xa0 | (slave << 4));
         ata_settle(&a);
         UINT8 s = inb(base + 7);
@@ -3523,6 +3431,7 @@ static int ata_probe_channel(UINT16 base, UINT16 control)
             UINT16 caps = rd16(identity + 166);
             if ((caps & 0xc000) == 0x4000)
                 d->flush_command = (a.lba48 && (caps & 0x2000)) ? 0xea : (caps & 0x1000) ? 0xe7 : 0;
+            __atomic_add_fetch(&disk_count, 1, __ATOMIC_RELEASE);
         }
         ++ata_count;
     }
@@ -3634,20 +3543,17 @@ int k_storage_init(void)
         }
     return 0;
 }
-UINT32 k_disk_count(void)
-{
-    return disk_count;
-}
+UINT32 k_disk_count(void) { return __atomic_load_n(&disk_count, __ATOMIC_ACQUIRE); }
 int k_disk_get(UINT32 id, k_disk_info *out)
 {
-    if (id >= disk_count || !out)
+    if (id >= k_disk_count() || !out)
         return K_ENOENT;
     *out = disks[id].info;
     return 0;
 }
 static int disk_range(UINT32 id, UINT64 lba, UINT32 count, UINT64 bytes)
 {
-    if (id >= disk_count || !count)
+    if (id >= k_disk_count() || !count)
         return K_EINVAL;
     disk *d = &disks[id];
     if (!d->info.online)
@@ -3659,7 +3565,7 @@ static int disk_range(UINT32 id, UINT64 lba, UINT32 count, UINT64 bytes)
 }
 int k_disk_read(UINT32 id, UINT64 lba, UINT32 count, void *out, UINT64 bytes)
 {
-    if (!out || k_cpu_id() != 0)
+    if (!out)
         return K_EINVAL;
     int e = disk_range(id, lba, count, bytes);
     if (e)
@@ -3683,12 +3589,12 @@ int k_disk_read(UINT32 id, UINT64 lba, UINT32 count, void *out, UINT64 bytes)
 }
 int k_disk_write(UINT32 id, UINT64 lba, UINT32 count, const void *in, UINT64 bytes)
 {
-    if (id >= disk_count)
+    if (id >= k_disk_count())
         return K_EINVAL;
-    /* Check immutability before examining data or submitting any command. */
+    /* Check write fencing before inspecting buffers or submitting commands. */
     if (disks[id].kind != DISK_RAM)
         return K_EROFS;
-    if (!in || k_cpu_id() != 0)
+    if (!in)
         return K_EINVAL;
     int e = disk_range(id, lba, count, bytes);
     if (e)
@@ -3700,8 +3606,7 @@ int k_disk_write(UINT32 id, UINT64 lba, UINT32 count, const void *in, UINT64 byt
     k_mutex_unlock(&storage_mutex);
     return 0;
 }
-/* Filesystem-private writes: the public raw physical-disk API stays fenced.
- * Callers hold vfs_mutex and supply a checked volume-relative range. */
+/* Physical disk writes are private to checked filesystem paths; the public raw API stays fenced. */
 static int disk_flush_locked(disk *d)
 {
     if (d->kind == DISK_RAM)
@@ -3736,7 +3641,7 @@ static int disk_flush_locked(disk *d)
 }
 static int disk_flush(UINT32 id)
 {
-    if (id >= disk_count || k_cpu_id() != 0)
+    if (id >= k_disk_count())
         return K_EINVAL;
     int e = k_mutex_lock(&storage_mutex);
     if (e)
@@ -3747,7 +3652,7 @@ static int disk_flush(UINT32 id)
 }
 static int disk_write_fs(UINT32 id, UINT64 lba, UINT32 count, const void *in, UINT64 bytes)
 {
-    if (!in || k_cpu_id() != 0)
+    if (!in)
         return K_EINVAL;
     int e = disk_range(id, lba, count, bytes);
     if (e)
@@ -3846,10 +3751,14 @@ int k_ramdisk_create(UINT32 sectors, UINT32 *id)
         return K_ENOMEM;
     }
     d->ram = (void *)(UINTN)p;
+    __atomic_add_fetch(&disk_count, 1, __ATOMIC_RELEASE);
     *id = d->info.id;
     return 0;
 }
 
+#define MAX_PARTITIONS 128
+static k_partition_info partitions[MAX_PARTITIONS];
+static UINT32 partition_count;
 #define MAX_VOLUMES 48
 #define MAX_NODES 192
 #define MAX_ROOTS 64
@@ -3866,7 +3775,7 @@ typedef struct {
 } fat_volume;
 typedef struct {
     char path[K_PATH_MAX];
-    UINT32 volume;
+    UINT32 volume, kind;
 } mount_entry;
 typedef struct {
     BOOLEAN used, directory;
@@ -3885,6 +3794,17 @@ static struct {
 static UINT32 root_count;
 static k_mutex vfs_mutex = K_MUTEX_INIT;
 static BOOLEAN vfs_ready;
+static int native_create(UINT32, const char *, BOOLEAN, k_file *);
+static int native_store(UINT32, const char *, const void *, UINT64);
+static int ext_replace(k_file *, const void *, UINT64);
+static int ntfs_replace(k_file *, const void *, UINT64);
+static int ext_create(UINT32, const char *, BOOLEAN, const void *, UINT64, k_file *);
+static int native_open(UINT32, const char *, k_file *);
+static int native_read(const k_file *, UINT64, void *, UINT64, UINT64 *);
+static int native_list(const k_file *, k_dir_callback, void *);
+static int native_write(k_file *, UINT64, const void *, UINT64, UINT64 *);
+static const char *native_description(UINT32);
+static int native_sync_all(void);
 static int fat_open(UINT32, const char *, k_file *);
 static int fat_read(const k_file *, UINT64, void *, UINT64, UINT64 *);
 static int fat_list(const k_file *, k_dir_callback, void *);
@@ -3918,7 +3838,7 @@ int k_path_resolve(const char *path, const char *cwd, char out[K_PATH_MAX])
         }
         name[n] = 0;
         BOOLEAN found = FALSE;
-        for (UINT32 i = 0; i < root_count; ++i)
+        for (UINT32 i = 0; i < __atomic_load_n(&root_count, __ATOMIC_ACQUIRE); ++i)
             if (str_eq(name, roots[i].name)) {
                 str_copy(out, roots[i].path, K_PATH_MAX);
                 found = TRUE;
@@ -3981,6 +3901,8 @@ int k_path_resolve(const char *path, const char *cwd, char out[K_PATH_MAX])
 }
 int k_root_bind(const char *name, const char *path)
 {
+    if (k_cpu_id() != 0)
+        return K_EPERM;
     if (!name || !path || !*name || str_len(name) > 31 || *path != '/')
         return K_EINVAL;
     for (const char *p = name; *p; ++p)
@@ -3991,27 +3913,31 @@ int k_root_bind(const char *name, const char *path)
     int e = k_path_resolve(path, "/", normalized);
     if (e)
         return e;
-    for (UINT32 i = 0; i < root_count; ++i)
+    for (UINT32 i = 0; i < __atomic_load_n(&root_count, __ATOMIC_ACQUIRE); ++i)
         if (str_eq(name, roots[i].name))
             return str_eq(normalized, roots[i].path) ? 0 : K_EEXIST;
     if (root_count == MAX_ROOTS)
         return K_E2BIG;
     str_copy(roots[root_count].name, name, 32);
     str_copy(roots[root_count].path, normalized, K_PATH_MAX);
-    ++root_count;
+    __atomic_add_fetch(&root_count, 1, __ATOMIC_RELEASE);
     return 0;
 }
 void k_roots_list(void (*cb)(const char *, const char *, void *), void *arg)
 {
     if (cb)
-        for (UINT32 i = 0; i < root_count; ++i)
+        for (UINT32 i = 0; i < __atomic_load_n(&root_count, __ATOMIC_ACQUIRE); ++i)
             cb(roots[i].name, roots[i].path, arg);
 }
 void k_mounts_list(void (*cb)(const char *, const char *, void *), void *arg)
 {
     if (cb) {
         cb("/", "RAM namespace (volatile)", arg);
-        for (UINT32 i = 0; i < mount_count; ++i) {
+        for (UINT32 i = 0; i < __atomic_load_n(&mount_count, __ATOMIC_ACQUIRE); ++i) {
+            if (mounts[i].kind >= 4) {
+                cb(mounts[i].path, native_description(mounts[i].volume), arg);
+                continue;
+            }
             fat_volume *v = &volumes[mounts[i].volume];
             char description[128];
             str_copy(description, v->source, sizeof(description));
@@ -4092,7 +4018,7 @@ static int choose_mount(const char *path)
 {
     int best = -1;
     UINTN longest = 0;
-    for (UINT32 i = 0; i < mount_count; ++i)
+    for (UINT32 i = 0; i < __atomic_load_n(&mount_count, __ATOMIC_ACQUIRE); ++i)
         if (path_prefix(path, mounts[i].path)) {
             UINTN n = str_len(mounts[i].path);
             if (n > longest) {
@@ -4113,7 +4039,7 @@ int k_vfs_init(void)
 }
 int k_vfs_mkdir(const char *path)
 {
-    if (!vfs_ready || k_cpu_id() != 0)
+    if (!vfs_ready)
         return K_EINVAL;
     char canonical_path[K_PATH_MAX];
     int e = k_path_resolve(path, "/", canonical_path);
@@ -4124,8 +4050,11 @@ int k_vfs_mkdir(const char *path)
         return e;
     int mount = choose_mount(canonical_path);
     if (mount >= 0)
-        e = fat_create_locked(mounts[mount].volume, canonical_path + str_len(mounts[mount].path),
-                              TRUE, NULL);
+        e = mounts[mount].kind >= 4
+                ? native_create(mounts[mount].volume, canonical_path + str_len(mounts[mount].path),
+                                TRUE, NULL)
+                : fat_create_locked(mounts[mount].volume,
+                                    canonical_path + str_len(mounts[mount].path), TRUE, NULL);
     else {
         e = ram_new(canonical_path, TRUE);
         if (e >= 0)
@@ -4136,7 +4065,7 @@ int k_vfs_mkdir(const char *path)
 }
 int k_vfs_put(const char *path, const void *bytes, UINT64 size)
 {
-    if (!vfs_ready || (!bytes && size) || size > 4 * 1024 * 1024 || k_cpu_id() != 0)
+    if (!vfs_ready || (!bytes && size) || size > 4 * 1024 * 1024)
         return K_EINVAL;
     char canonical_path[K_PATH_MAX];
     int e = k_path_resolve(path, "/", canonical_path);
@@ -4147,6 +4076,11 @@ int k_vfs_put(const char *path, const void *bytes, UINT64 size)
         return e;
     int mount = choose_mount(canonical_path);
     if (mount >= 0) {
+        if (mounts[mount].kind >= 4) {
+            e = native_store(mounts[mount].volume, canonical_path + str_len(mounts[mount].path),
+                             bytes, size);
+            goto end;
+        }
         e = fat_store_locked(mounts[mount].volume, canonical_path + str_len(mounts[mount].path),
                              bytes, size);
         goto end;
@@ -4186,6 +4120,8 @@ end:
 static int vfs_open_locked(const char *path, k_file *out)
 {
     int m = choose_mount(path);
+    if (m >= 0 && mounts[m].kind >= 4)
+        return native_open(mounts[m].volume, path + str_len(mounts[m].path), out);
     if (m >= 0)
         return fat_open(mounts[m].volume, path + str_len(mounts[m].path), out);
     int n = ram_walk(path);
@@ -4198,7 +4134,7 @@ static int vfs_open_locked(const char *path, k_file *out)
 }
 int k_vfs_open(const char *path, k_file *out)
 {
-    if (!vfs_ready || !out || k_cpu_id() != 0)
+    if (!vfs_ready || !out)
         return K_EINVAL;
     char resolved[K_PATH_MAX];
     int e = k_path_resolve(path, "/", resolved);
@@ -4213,7 +4149,7 @@ int k_vfs_open(const char *path, k_file *out)
 }
 static int disk_bytes(UINT32 id, UINT64 offset, void *out, UINT64 n)
 {
-    if (id >= disk_count || offset > disks[id].info.sectors * disks[id].info.sector_size ||
+    if (id >= k_disk_count() || offset > disks[id].info.sectors * disks[id].info.sector_size ||
         n > disks[id].info.sectors * disks[id].info.sector_size - offset)
         return K_EINVAL;
     UINT8 sector[4096], *p = out;
@@ -4244,7 +4180,7 @@ static int disk_bytes(UINT32 id, UINT64 offset, void *out, UINT64 n)
 }
 int k_vfs_read(const k_file *file, UINT64 offset, void *out, UINT64 n, UINT64 *got)
 {
-    if (!file || (!out && n) || !got || k_cpu_id() != 0)
+    if (!file || (!out && n) || !got)
         return K_EINVAL;
     *got = 0;
     if (file->attributes & 0x10)
@@ -4263,10 +4199,12 @@ int k_vfs_read(const k_file *file, UINT64 offset, void *out, UINT64 n, UINT64 *g
             mem_copy(out, r->data + offset, n);
             *got = n;
         }
-    } else if (file->kind == 2)
+    } else if (file->kind == 4 || file->kind == 5)
+        e = native_read(file, offset, out, n, got);
+    else if (file->kind == 2)
         e = fat_read(file, offset, out, n, got);
     else if (file->kind == 3) {
-        if (file->object >= disk_count) {
+        if (file->object >= k_disk_count()) {
             e = K_ENOENT;
             goto end;
         }
@@ -4285,7 +4223,7 @@ end:
 }
 int k_vfs_list(const char *path, k_dir_callback cb, void *arg)
 {
-    if (!path || !cb || k_cpu_id() != 0)
+    if (!path || !cb)
         return K_EINVAL;
     char resolved[K_PATH_MAX];
     int e = k_path_resolve(path, "/", resolved);
@@ -4302,7 +4240,9 @@ int k_vfs_list(const char *path, k_dir_callback cb, void *arg)
         e = K_EINVAL;
         goto end;
     }
-    if (f.kind == 2)
+    if (f.kind == 4 || f.kind == 5)
+        e = native_list(&f, cb, arg);
+    else if (f.kind == 2)
         e = fat_list(&f, cb, arg);
     else if (f.kind == 1)
         for (UINT32 i = 1; i < MAX_NODES; ++i)
@@ -4318,8 +4258,7 @@ end:
     return e;
 }
 
-/* FAT12/16/32 read support. All arithmetic remains relative to a validated
- * partition and all cluster walks are bounded. No metadata is ever repaired. */
+/* FAT walks stay partition-relative and bounded; metadata is never auto-repaired. */
 static int volume_bytes(fat_volume *v, UINT64 offset, void *out, UINT64 n)
 {
     if (!span_ok(offset, n, v->length * v->sector))
@@ -4625,16 +4564,9 @@ static int fat_list(const k_file *file, k_dir_callback cb, void *arg)
     fat_listing l = {cb, arg};
     return fat_directory(&volumes[file->object], file->cluster, fat_list_cb, &l);
 }
-/* Writable FAT16/32. First mutation validates every referenced cluster and
- * mirrored FAT before enabling writes. Allocation tables stay cached under
- * vfs_mutex; there must be no other OS writing this mounted volume.
- *
- * Replacement ordering: dirty flag -> new data -> new FAT chain -> directory
- * entry -> release old chain -> clean flag, with device flushes between stages.
- * This is copy-on-write data replacement, NOT a power-fail-safe journal:
- * torn metadata sectors or a device that lies about flush can still damage FAT.
- * Any error during mutation freezes the volume read-only for this boot.
- */
+/* Before first FAT16/32 write, audit referenced clusters and mirrored FATs.
+ * Replacement order is dirty -> data -> FAT -> directory -> old chain -> clean, with flushes.
+ * This is not a power-fail-safe journal; mutation errors freeze the volume read-only. */
 #define FAT_WRITE_MAX (4ULL * 1024 * 1024)
 #define FAT_CACHE_MAX (64ULL * 1024 * 1024)
 #define FAT_DIR_LIMIT 4096
@@ -4642,10 +4574,7 @@ static UINT32 fat_cached(fat_volume *v, UINT32 c)
 {
     return v->fat_bits == 16 ? rd16(v->cache + 2ULL * c) : rd32(v->cache + 4ULL * c) & 0x0fffffff;
 }
-static UINT32 fat_eoc(fat_volume *v)
-{
-    return v->fat_bits == 16 ? 0xffff : 0x0fffffff;
-}
+static UINT32 fat_eoc(fat_volume *v) { return v->fat_bits == 16 ? 0xffff : 0x0fffffff; }
 static BOOLEAN fat_is_end(fat_volume *v, UINT32 n)
 {
     return n >= (v->fat_bits == 16 ? 0xfff8U : 0x0ffffff8U);
@@ -4769,7 +4698,7 @@ static int fat_prepare_write(fat_volume *v)
     if ((fat_cached(v, 1) & mask) != mask) {
         e = K_EROFS;
         goto fail;
-    } /* dirty/error flag */
+    }
     if (v->mirrored && v->fat_count > 1) {
         UINT8 sector[4096];
         for (UINT64 s = 0; s < v->fat_sectors; ++s) {
@@ -4803,7 +4732,7 @@ static int fat_prepare_write(fat_volume *v)
         }
         if (!bit_get(v->used, c) && value != (v->fat_bits == 16 ? 0xfff7U : 0x0ffffff7U)) {
             e = K_EIO;
-            goto fail; /* orphan/reserved/cross-linked filesystem needs fsck */
+            goto fail;
         }
     }
     v->alloc_hint = 2;
@@ -4822,8 +4751,7 @@ static int fat_begin_write(fat_volume *v)
     int e = fat_flush_cache(v);
     if (e)
         return e;
-    /* FSInfo is only a hint. Invalidate valid primary/backup hints instead of
-     * trusting or incrementally maintaining potentially stale free counts. */
+    /* FSInfo is a hint; invalidate stale free-count hints instead of trusting them. */
     if (v->fat_bits == 32 && v->fsinfo && v->fsinfo < v->first_fat) {
         UINT8 sector[4096];
         UINT32 offsets[2] = {v->fsinfo, v->backup_boot + v->fsinfo};
@@ -4898,7 +4826,7 @@ static int fat_entry_write(fat_volume *v, UINT64 off, const UINT8 data[32])
         return K_EINVAL;
     UINT64 lba = off / v->sector;
     UINT32 at = off % v->sector;
-    /* Directory entries must be in the fixed root or data area, never BPB/FAT. */
+    /* Directory entries may not point into BPB/FAT metadata. */
     if (lba < v->root_start || (v->fat_bits == 32 && lba < v->data_start))
         return K_EPERM;
     int e = volume_bytes(v, lba * v->sector, sector, v->sector);
@@ -4912,7 +4840,7 @@ static int fat_refresh(k_file *f)
     if (f->kind != 2 || f->object >= volume_count)
         return K_EINVAL;
     if (!f->directory_offset)
-        return 0; /* volume root */
+        return 0;
     fat_volume *v = &volumes[f->object];
     UINT8 d[32];
     int e = volume_bytes(v, f->directory_offset, d, 32);
@@ -5006,8 +4934,7 @@ static int fat_replace_locked(k_file *f, const void *data, UINT64 size)
     }
     return fat_finish_write(v, e);
 }
-/* Locate up to 21 contiguous deleted/end entries plus a replacement end
- * marker. If needed, grow a cluster-backed directory using zeroed clusters. */
+
 static int fat_slots(fat_volume *v, UINT32 dir, UINT32 need, UINT64 slots[22], BOOLEAN *end,
                      BOOLEAN grow)
 {
@@ -5049,7 +4976,7 @@ static int fat_slots(fat_volume *v, UINT32 dir, UINT32 need, UINT64 slots[22], B
             if (!e)
                 e = volume_flush(v);
             if (!e)
-                e = fat_flush_cache(v); /* new cluster durable before linking */
+                e = fat_flush_cache(v); /* New directory cluster is flushed before linking. */
             if (e)
                 return e;
             fat_cache_set(v, cluster, next);
@@ -5135,7 +5062,7 @@ static int fat_create_locked(UINT32 index, const char *path, BOOLEAN directory, 
     if (e)
         return e;
     if (v->free_clusters < 4)
-        return K_ENOSPC; /* directory growth plus new subdirectory */
+        return K_ENOSPC;
     UINT8 shortname[11];
     static const char hex[] = "0123456789ABCDEF";
     mem_copy(shortname, "K0000000FIL", 11);
@@ -5173,7 +5100,7 @@ static int fat_create_locked(UINT32 index, const char *path, BOOLEAN directory, 
         if (!e)
             e = volume_flush(v);
     }
-    /* Deleted placeholders ensure a partial LFN never exposes stale entries. */
+    /* Write deleted placeholders first so a partial LFN never exposes stale entries. */
     d[0] = 0xe5;
     for (UINT32 i = 0; !e && i < needed; ++i)
         e = fat_entry_write(v, slots[i], d);
@@ -5226,7 +5153,7 @@ static int fat_create_locked(UINT32 index, const char *path, BOOLEAN directory, 
     mem_zero(d, 32);
     mem_copy(d, shortname, 11);
     d[11] = directory ? 0x10 : 0x20;
-    d[16] = d[18] = d[24] = 0x21; /* valid DOS date: 1980-01-01 */
+    d[16] = d[18] = d[24] = 0x21;
     fat_set_first(d, first, 0);
     if (!e)
         e = fat_entry_write(v, slots[lfns], d);
@@ -5250,8 +5177,9 @@ static int fat_store_locked(UINT32 index, const char *path, const void *data, UI
 
 static int fat_mount(UINT32 disk_id, UINT64 start, UINT64 length, UINT32 partition)
 {
-    if (volume_count == MAX_VOLUMES || disk_id >= disk_count || !length ||
-        start >= disks[disk_id].info.sectors || length > disks[disk_id].info.sectors - start)
+    if (volume_count == MAX_VOLUMES || mount_count == MAX_VOLUMES || disk_id >= k_disk_count() ||
+        !length || start >= disks[disk_id].info.sectors ||
+        length > disks[disk_id].info.sectors - start)
         return K_EINVAL;
     UINT8 boot[4096];
     int e = k_disk_read(disk_id, start, 1, boot, sizeof(boot));
@@ -5330,7 +5258,9 @@ static int fat_mount(UINT32 disk_id, UINT64 start, UINT64 length, UINT32 partiti
     }
     str_copy(v->source, source, sizeof(v->source));
     str_copy(mounts[mount_count].path, path, K_PATH_MAX);
-    mounts[mount_count++].volume = volume_count++;
+    mounts[mount_count].kind = 2;
+    mounts[mount_count].volume = volume_count++;
+    __atomic_add_fetch(&mount_count, 1, __ATOMIC_RELEASE);
     (void)k_root_bind(source, path);
     char alias[20];
     decimal_name(alias, "disk", disk_id);
@@ -5340,7 +5270,7 @@ static int fat_mount(UINT32 disk_id, UINT64 start, UINT64 length, UINT32 partiti
 
 int k_vfs_create(const char *path, k_file *out)
 {
-    if (!vfs_ready || !out || k_cpu_id() != 0)
+    if (!vfs_ready || !out)
         return K_EINVAL;
     char resolved[K_PATH_MAX];
     int e = k_path_resolve(path, "/", resolved);
@@ -5356,7 +5286,11 @@ int k_vfs_create(const char *path, k_file *out)
     else if (e == K_ENOENT) {
         int m = choose_mount(resolved);
         if (m >= 0)
-            e = fat_create_locked(mounts[m].volume, resolved + str_len(mounts[m].path), FALSE, out);
+            e = mounts[m].kind >= 4
+                    ? native_create(mounts[m].volume, resolved + str_len(mounts[m].path), FALSE,
+                                    out)
+                    : fat_create_locked(mounts[m].volume, resolved + str_len(mounts[m].path), FALSE,
+                                        out);
         else {
             e = ram_new(resolved, FALSE);
             if (e >= 0)
@@ -5368,7 +5302,7 @@ int k_vfs_create(const char *path, k_file *out)
 }
 int k_vfs_write(k_file *file, UINT64 offset, const void *data, UINT64 n, UINT64 *written)
 {
-    if (!file || !written || (!data && n) || k_cpu_id() != 0)
+    if (!file || !written || (!data && n))
         return K_EINVAL;
     *written = 0;
     if (file->kind == 3)
@@ -5378,6 +5312,11 @@ int k_vfs_write(k_file *file, UINT64 offset, const void *data, UINT64 n, UINT64 
     int e = k_mutex_lock(&vfs_mutex);
     if (e)
         return e;
+    if (file->kind == 4 || file->kind == 5) {
+        e = native_write(file, offset, data, n, written);
+        k_mutex_unlock(&vfs_mutex);
+        return e;
+    }
     UINT8 *image = NULL;
     UINT32 pages = 0;
     if (file->kind == 2) {
@@ -5446,8 +5385,6 @@ done:
 }
 int k_vfs_sync(void)
 {
-    if (k_cpu_id() != 0)
-        return K_EINVAL;
     int e = k_mutex_lock(&vfs_mutex);
     if (e)
         return e;
@@ -5461,12 +5398,15 @@ int k_vfs_sync(void)
         if (result && !e)
             e = result;
     }
+    int ne = native_sync_all();
+    if (!e)
+        e = ne;
     k_mutex_unlock(&vfs_mutex);
     return e;
 }
 int k_vfs_mount_ramfat(UINT32 id)
 {
-    if (k_cpu_id() != 0 || id >= disk_count || disks[id].kind != DISK_RAM)
+    if (k_cpu_id() != 0 || id >= k_disk_count() || disks[id].kind != DISK_RAM)
         return K_EPERM;
     for (UINT32 i = 0; i < volume_count; ++i)
         if (volumes[i].disk == id)
@@ -5474,8 +5414,2807 @@ int k_vfs_mount_ramfat(UINT32 id)
     return fat_mount(id, 0, disks[id].info.sectors, 0);
 }
 
-/* GPT and MBR/EBR are decoded read-only. GPT header AND entry-array CRCs
- * must match; corrupt GPT is never reinterpreted as an MBR FAT partition. */
+#define NATIVE_RUNS 256
+#define NATIVE_SCAN_MAX (32ULL * 1024 * 1024)
+typedef struct {
+    UINT64 logical, physical, length;
+    BOOLEAN hole;
+} native_run;
+typedef struct {
+    UINT32 kind, disk, sector, block;
+    UINT64 start, length, blocks;
+    BOOLEAN read_only, failed, wrote;
+    char source[24];
+    UINT8 super[1024];
+    UINT32 inode_size, inodes, inodes_per_group, blocks_per_group, groups, desc_size, csum_seed;
+    BOOLEAN csum, gdt_csum;
+    UINT32 record_size, index_size, mft_count;
+    UINT64 mft_size;
+    native_run mft[NATIVE_RUNS];
+    UINT32 mft_runs;
+} native_volume;
+static native_volume native_volumes[MAX_VOLUMES];
+static UINT32 native_count;
+static UINT32 crc32c_step(UINT32 crc, const UINT8 *p, UINTN n)
+{
+    while (n--) {
+        crc ^= *p++;
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0x82f63b78u & (0 - (crc & 1)));
+    }
+    return crc;
+}
+static UINT16 crc16_step(UINT16 crc, const UINT8 *p, UINTN n)
+{
+    while (n--) {
+        crc ^= *p++;
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (UINT16)((crc >> 1) ^ (0xa001u & (0 - (crc & 1))));
+    }
+    return crc;
+}
+static int native_bytes(native_volume *v, UINT64 offset, void *out, UINT64 bytes)
+{
+    if (!span_ok(offset, bytes, v->length * v->sector))
+        return K_EIO;
+    return disk_bytes(v->disk, v->start * v->sector + offset, out, bytes);
+}
+static int native_write_bytes(native_volume *v, UINT64 offset, const void *in, UINT64 bytes)
+{
+    if (v->read_only || v->failed)
+        return K_EROFS;
+    if (!span_ok(offset, bytes, v->length * v->sector))
+        return K_EIO;
+    UINT8 sector[4096];
+    const UINT8 *p = in;
+    int e = 0;
+    while (bytes && !e) {
+        UINT64 lba = offset / v->sector;
+        UINT32 at = (UINT32)(offset % v->sector), n = (UINT32)MIN(bytes, v->sector - at);
+        if (at || n < v->sector)
+            e = native_bytes(v, lba * v->sector, sector, v->sector);
+        if (e)
+            break;
+        mem_copy(sector + at, p, n);
+        e = disk_write_fs(v->disk, v->start + lba, 1, sector, v->sector);
+        p += n;
+        offset += n;
+        bytes -= n;
+    }
+    if (!e)
+        e = disk_flush(v->disk);
+    if (e)
+        v->failed = TRUE;
+    else
+        v->wrote = TRUE;
+    return e;
+}
+static int run_add(native_volume *v, native_run *runs, UINT32 *count, UINT64 logical,
+                   UINT64 physical, UINT64 length, BOOLEAN hole)
+{
+    if (!length || *count == NATIVE_RUNS || logical > ~0ULL - length ||
+        (!hole && (physical >= v->blocks || length > v->blocks - physical)))
+        return K_EIO;
+    if (*count && logical < runs[*count - 1].logical + runs[*count - 1].length)
+        return K_EIO;
+    if (!hole)
+        for (UINT32 i = 0; i < *count; ++i)
+            if (!runs[i].hole && overlap(physical, length, runs[i].physical, runs[i].length))
+                return K_EIO;
+    runs[(*count)++] = (native_run){logical, physical, length, hole};
+    return 0;
+}
+static int run_io(native_volume *v, const native_run *runs, UINT32 count, UINT64 offset, void *data,
+                  UINT64 bytes, BOOLEAN write)
+{
+    UINT8 *p = data;
+    while (bytes) {
+        UINT64 logical = offset / v->block, at = offset % v->block, n = MIN(bytes, v->block - at);
+        const native_run *r = NULL;
+        for (UINT32 i = 0; i < count; ++i)
+            if (logical >= runs[i].logical && logical - runs[i].logical < runs[i].length) {
+                r = &runs[i];
+                break;
+            }
+        if (!r || r->hole) {
+            if (write)
+                return K_ENOTSUP;
+            mem_zero(p, n);
+        } else {
+            UINT64 physical = (r->physical + logical - r->logical) * v->block + at;
+            int e = write ? native_write_bytes(v, physical, p, n) : native_bytes(v, physical, p, n);
+            if (e)
+                return e;
+        }
+        offset += n;
+        p += n;
+        bytes -= n;
+    }
+    return 0;
+}
+static int ext_group(native_volume *v, UINT32 group, UINT8 desc[64])
+{
+    if (group >= v->groups)
+        return K_EIO;
+    UINT64 table = (v->block == 1024 ? 2ULL : 1ULL) * v->block;
+    int e = native_bytes(v, table + (UINT64)group * v->desc_size, desc, v->desc_size);
+    if (e)
+        return e;
+    UINT8 g[4];
+    wr32(g, group);
+    UINT16 wanted = rd16(desc + 30);
+    desc[30] = desc[31] = 0;
+    if (v->csum) {
+        UINT32 crc = crc32c_step(v->csum_seed, g, 4);
+        crc = crc32c_step(crc, desc, v->desc_size);
+        if ((UINT16)crc != wanted)
+            e = K_EIO;
+    } else if (v->gdt_csum) {
+        UINT16 crc = crc16_step(0xffff, v->super + 104, 16);
+        crc = crc16_step(crc, g, 4);
+        crc = crc16_step(crc, desc, 30);
+        if (v->desc_size > 32)
+            crc = crc16_step(crc, desc + 32, v->desc_size - 32);
+        if (crc != wanted)
+            e = K_EIO;
+    }
+    if (!e) {
+        UINT64 table = rd32(desc + 8) | (v->desc_size == 64 ? (UINT64)rd32(desc + 40) << 32 : 0);
+        UINT64 bitmap = rd32(desc) | (v->desc_size == 64 ? (UINT64)rd32(desc + 32) << 32 : 0);
+        UINT64 inodemap = rd32(desc + 4) | (v->desc_size == 64 ? (UINT64)rd32(desc + 36) << 32 : 0);
+        UINT64 blocks = ((UINT64)v->inodes_per_group * v->inode_size + v->block - 1) / v->block;
+        if (!table || table >= v->blocks || blocks > v->blocks - table || !bitmap ||
+            bitmap >= v->blocks || !inodemap || inodemap >= v->blocks || bitmap == inodemap ||
+            overlap(bitmap, 1, table, blocks) || overlap(inodemap, 1, table, blocks))
+            e = K_EIO;
+    }
+    wr16(desc + 30, wanted);
+    return e;
+}
+static UINT64 ext_desc_block(native_volume *v, const UINT8 *d, UINT32 off)
+{
+    return rd32(d + off) | (v->desc_size == 64 ? (UINT64)rd32(d + off + 32) << 32 : 0);
+}
+static UINT32 ext_inode_seed(native_volume *v, UINT32 inode, const UINT8 *raw)
+{
+    UINT8 n[4];
+    wr32(n, inode);
+    UINT32 c = crc32c_step(v->csum_seed, n, 4);
+    return crc32c_step(c, raw + 100, 4);
+}
+static int ext_inode(native_volume *v, UINT32 inode, UINT8 raw[512])
+{
+    if (!inode || inode > v->inodes)
+        return K_EIO;
+    UINT8 d[64];
+    UINT32 group = (inode - 1) / v->inodes_per_group;
+    int e = ext_group(v, group, d);
+    if (e)
+        return e;
+    UINT64 table = ext_desc_block(v, d, 8);
+    UINT64 offset = (UINT64)((inode - 1) % v->inodes_per_group) * v->inode_size;
+    if (!table || table >= v->blocks || offset + v->inode_size > (v->blocks - table) * v->block)
+        return K_EIO;
+    e = native_bytes(v, table * v->block + offset, raw, v->inode_size);
+    if (e)
+        return e;
+    if (v->csum) {
+        UINT32 wanted = rd16(raw + 124);
+        wr16(raw + 124, 0);
+        BOOLEAN high = v->inode_size >= 132 && rd16(raw + 128) >= 4;
+        if (high) {
+            wanted |= (UINT32)rd16(raw + 130) << 16;
+            wr16(raw + 130, 0);
+        }
+        UINT32 crc = crc32c_step(ext_inode_seed(v, inode, raw), raw, v->inode_size);
+        wr16(raw + 124, (UINT16)wanted);
+        if (high)
+            wr16(raw + 130, (UINT16)(wanted >> 16));
+        if ((high ? crc : (UINT16)crc) != wanted)
+            return K_EIO;
+    }
+    if (!rd16(raw + 26) || rd32(raw + 20))
+        return K_ENOENT;
+    if (rd32(raw + 32) & (0x10000000u | 0x800u | 0x4u))
+        return K_ENOTSUP;
+    return 0;
+}
+static int ext_extents(native_volume *v, UINT32 seed, const UINT8 *h, UINT32 bytes, UINT32 depth,
+                       native_run *runs, UINT32 *count, UINT32 *budget)
+{
+    if (!*budget || bytes < 12 || rd16(h) != 0xf30a || rd16(h + 6) != depth || depth > 5)
+        return K_EIO;
+    --*budget;
+    UINT32 entries = rd16(h + 2), max = rd16(h + 4);
+    if (entries > max || max > (bytes - 12) / 12 || !max)
+        return K_EIO;
+    UINT64 last = 0;
+    for (UINT32 i = 0; i < entries; ++i) {
+        const UINT8 *x = h + 12 + i * 12;
+        UINT64 logical = rd32(x);
+        if (i && logical <= last)
+            return K_EIO;
+        last = logical;
+        if (!depth) {
+            UINT32 len = rd16(x + 4);
+            BOOLEAN hole = len > 32768;
+            if (hole)
+                len -= 32768;
+            UINT64 physical = rd32(x + 8) | ((UINT64)rd16(x + 6) << 32);
+            int e = run_add(v, runs, count, logical, physical, len, hole);
+            if (e)
+                return e;
+        } else {
+            UINT64 physical = rd32(x + 4) | ((UINT64)rd16(x + 8) << 32);
+            if (!physical || physical >= v->blocks)
+                return K_EIO;
+            UINT64 page = pmm_alloc_page();
+            if (!page)
+                return K_ENOMEM;
+            UINT8 *b = (void *)(UINTN)page;
+            int e = native_bytes(v, physical * v->block, b, v->block);
+            if (!e && v->csum) {
+                UINT32 tail = 12 + 12 * rd16(b + 4);
+                if (tail > v->block - 4 || crc32c_step(seed, b, tail) != rd32(b + tail))
+                    e = K_EIO;
+            }
+            if (!e)
+                e = ext_extents(v, seed, b, v->block, depth - 1, runs, count, budget);
+            pmm_free_page(page);
+            if (e)
+                return e;
+        }
+    }
+    return 0;
+}
+static int ext_map(native_volume *v, UINT32 inode, const UINT8 *raw, native_run *runs,
+                   UINT32 *count)
+{
+    *count = 0;
+    if (rd32(raw + 32) & 0x80000) {
+        UINT32 budget = 1024;
+        return ext_extents(v, ext_inode_seed(v, inode, raw), raw + 40, 60, rd16(raw + 46), runs,
+                           count, &budget);
+    }
+
+    if (rd32(raw + 92) || rd32(raw + 96))
+        return K_ENOTSUP;
+    for (UINT32 i = 0; i < 12; ++i) {
+        UINT32 p = rd32(raw + 40 + 4 * i);
+        if (p) {
+            int e = run_add(v, runs, count, i, p, 1, FALSE);
+            if (e)
+                return e;
+        }
+    }
+    UINT32 indirect = rd32(raw + 88);
+    if (indirect) {
+        if (indirect >= v->blocks)
+            return K_EIO;
+        UINT8 b[4096];
+        int e = native_bytes(v, (UINT64)indirect * v->block, b, v->block);
+        if (e)
+            return e;
+        for (UINT32 i = 0; i < v->block / 4; ++i) {
+            UINT32 p = rd32(b + 4 * i);
+            if (p) {
+                e = run_add(v, runs, count, 12 + i, p, 1, FALSE);
+                if (e)
+                    return e;
+            }
+        }
+    }
+    return 0;
+}
+static UINT64 ext_size(const UINT8 *raw) { return rd32(raw + 4) | ((UINT64)rd32(raw + 108) << 32); }
+static int ext_directory(native_volume *v, UINT32 inode, const char *wanted, k_file *found,
+                         k_dir_callback cb, void *arg)
+{
+    UINT8 raw[512];
+    int e = ext_inode(v, inode, raw);
+    if (e)
+        return e;
+    if ((rd16(raw) & 0xf000) != 0x4000)
+        return K_EINVAL;
+    UINT64 size = ext_size(raw);
+    if (size > NATIVE_SCAN_MAX || size % v->block)
+        return K_ENOTSUP;
+    native_run runs[NATIVE_RUNS];
+    UINT32 count;
+    e = ext_map(v, inode, raw, runs, &count);
+    if (e)
+        return e;
+    UINT8 block[4096];
+    UINT32 seed = ext_inode_seed(v, inode, raw);
+    for (UINT64 off = 0; off < size; off += v->block) {
+        e = run_io(v, runs, count, off, block, v->block, FALSE);
+        if (e)
+            return e;
+        UINT32 limit = v->block;
+        if (v->csum) {
+
+            if (rd32(block + v->block - 12) == 0 && rd16(block + v->block - 8) == 12 &&
+                block[v->block - 5] == 0xde) {
+                if (crc32c_step(seed, block, v->block - 12) != rd32(block + v->block - 4))
+                    return K_EIO;
+                limit -= 12;
+            } else if (!(rd32(raw + 32) & 0x1000))
+                return K_EIO;
+        }
+        for (UINT32 at = 0; at < limit;) {
+            if (limit - at < 8)
+                return K_EIO;
+            UINT32 ino = rd32(block + at), rec = rd16(block + at + 4), len = block[at + 6];
+            if (rec < 8 || (rec & 3) || rec > limit - at || len > rec - 8)
+                return K_EIO;
+            if (ino && len && len <= 255) {
+                char name[256];
+                mem_copy(name, block + at + 8, len);
+                name[len] = 0;
+                for (UINT32 j = 0; j < len; ++j)
+                    if (!name[j])
+                        return K_EIO;
+                if (wanted && str_eq(name, wanted)) {
+                    UINT8 target[512];
+                    e = ext_inode(v, ino, target);
+                    if (e)
+                        return e;
+                    UINT32 mode = rd16(target) & 0xf000;
+                    if (mode != 0x4000 && mode != 0x8000)
+                        return K_ENOTSUP;
+                    *found = (k_file){4,
+                                      (UINT32)(v - native_volumes),
+                                      ino,
+                                      mode == 0x4000 ? 0x10 : 0,
+                                      ext_size(target),
+                                      rd32(target + 100)};
+                    return 0;
+                }
+                if (cb) {
+                    k_dirent entry;
+                    mem_zero(&entry, sizeof(entry));
+                    str_copy(entry.name, name, sizeof(entry.name));
+                    entry.directory = block[at + 7] == 2;
+                    UINT8 target[512];
+                    e = ext_inode(v, ino, target);
+                    if (e)
+                        return e;
+                    entry.size = ext_size(target);
+                    entry.directory = (rd16(target) & 0xf000) == 0x4000;
+                    cb(&entry, arg);
+                }
+            }
+            at += rec;
+        }
+    }
+    return wanted ? K_ENOENT : 0;
+}
+/* Verify NTFS USA fixups before parsing attributes or indexes. */
+static int ntfs_fixup(native_volume *v, UINT8 *record, UINT32 size, const char *magic)
+{
+    if (size < 48 || memcmp(record, magic, 4))
+        return K_EIO;
+    UINT32 off = rd16(record + 4), count = rd16(record + 6);
+    /* NTFS USA protection units are 512 bytes, including on 4Kn media. */
+    (void)v;
+    if (size % 512 || count != size / 512 + 1 || off < 8 || off > size || count * 2 > size - off)
+        return K_EIO;
+    UINT16 sequence = rd16(record + off);
+    for (UINT32 i = 1; i < count; ++i) {
+        UINT32 end = i * 512 - 2;
+        if (rd16(record + end) != sequence)
+            return K_EIO;
+        wr16(record + end, rd16(record + off + i * 2));
+    }
+    return 0;
+}
+static int ntfs_runs(native_volume *v, const UINT8 *a, UINT32 size, native_run *runs, UINT32 *count)
+{
+    if (size < 64 || a[8] != 1 || rd64(a + 16) != 0 || rd16(a + 12) & 0xc001 || rd16(a + 34))
+        return K_ENOTSUP;
+    UINT32 at = rd16(a + 32);
+    UINT64 vcn = 0;
+    INT64 lcn = 0;
+    *count = 0;
+    if (at < 64 || at >= size)
+        return K_EIO;
+    while (at < size && a[at]) {
+        UINT8 header = a[at++];
+        UINT32 lenbytes = header & 15, offbytes = header >> 4;
+        if (!lenbytes || lenbytes > 8 || offbytes > 8 || lenbytes + offbytes > size - at)
+            return K_EIO;
+        UINT64 len = 0, delta = 0;
+        for (UINT32 i = 0; i < lenbytes; ++i)
+            len |= (UINT64)a[at++] << (8 * i);
+        for (UINT32 i = 0; i < offbytes; ++i)
+            delta |= (UINT64)a[at++] << (8 * i);
+        if (offbytes && offbytes < 8 && (delta & (1ULL << (offbytes * 8 - 1))))
+            delta |= ~0ULL << (offbytes * 8);
+        if (offbytes) {
+            INT64 change = (INT64)delta;
+            if (change < 0) {
+                UINT64 sub = 0 - delta;
+                if (sub > (UINT64)lcn)
+                    return K_EIO;
+                lcn -= (INT64)sub;
+            } else {
+                if ((UINT64)change > 0x7fffffffffffffffULL - (UINT64)lcn)
+                    return K_EIO;
+                lcn += change;
+            }
+        }
+        int e = run_add(v, runs, count, vcn, (UINT64)lcn, len, !offbytes);
+        if (e)
+            return e;
+        vcn += len;
+    }
+    if (at >= size || !vcn || vcn > ~0ULL / v->block || rd64(a + 24) != vcn - 1 ||
+        rd64(a + 56) > rd64(a + 48) || rd64(a + 48) > vcn * v->block)
+        return K_EIO;
+    return 0;
+}
+static int ntfs_record(native_volume *v, UINT32 number, UINT8 record[4096])
+{
+    UINT64 off = (UINT64)number * v->record_size;
+    if (!span_ok(off, v->record_size, v->mft_size))
+        return K_EIO;
+    int e = run_io(v, v->mft, v->mft_runs, off, record, v->record_size, FALSE);
+    if (e)
+        return e;
+    e = ntfs_fixup(v, record, v->record_size, "FILE");
+    if (e)
+        return e;
+    UINT32 used = rd32(record + 24), alloc = rd32(record + 28), attrs = rd16(record + 20);
+    if (!(rd16(record + 22) & 1) || used > v->record_size || alloc != v->record_size ||
+        attrs < 48 || attrs > used || rd64(record + 32))
+        return K_EIO;
+    return 0;
+}
+static int ntfs_attr(native_volume *v, UINT8 *record, UINT32 type, const char *name, UINT8 **found,
+                     UINT32 *length)
+{
+    (void)v;
+    UINT32 at = rd16(record + 20), used = rd32(record + 24);
+    BOOLEAN seen = FALSE;
+    while (at + 4 <= used) {
+        UINT32 kind = rd32(record + at);
+        if (kind == 0xffffffff)
+            return seen ? 0 : K_ENOENT;
+        if (at + 16 > used)
+            return K_EIO;
+        UINT8 *a = record + at;
+        UINT32 n = rd32(a + 4);
+        if (n < 24 || (n & 7) || n > used - at || a[8] > 1)
+            return K_EIO;
+        if (kind == 0x20)
+            return K_ENOTSUP; /* Attribute lists require multi-record joining and are not handled here. */
+        UINT32 chars = a[9], noff = rd16(a + 10);
+        if (chars && (!span_ok(noff, chars * 2, n) || noff < 16))
+            return K_EIO;
+        BOOLEAN match = kind == type && chars == str_len(name);
+        for (UINT32 i = 0; match && i < chars; ++i)
+            if (rd16(a + noff + i * 2) != (UINT8)name[i])
+                match = FALSE;
+        if (match) {
+            if (seen)
+                return K_ENOTSUP;
+            *found = a;
+            *length = n;
+            seen = TRUE;
+        }
+        at += n;
+    }
+    return K_EIO;
+}
+static int ntfs_value(UINT8 *a, UINT32 n, UINT8 **bytes, UINT32 *size)
+{
+    if (a[8])
+        return K_ENOTSUP;
+    UINT32 at = rd16(a + 20), len = rd32(a + 16);
+    if (at < 24 || !span_ok(at, len, n) || rd16(a + 12))
+        return K_EIO;
+    *bytes = a + at;
+    *size = len;
+    return 0;
+}
+static int ntfs_store_record(native_volume *, UINT32, const UINT8 *);
+static int ntfs_dirty(native_volume *, BOOLEAN);
+static int ntfs_regular_writable(native_volume *, UINT32, UINT8 *);
+static int ntfs_data_boundaries(native_volume *, const native_run *, UINT32);
+static int ntfs_data(native_volume *v, UINT32 ino, UINT64 offset, void *buffer, UINT64 n,
+                     UINT64 *size, BOOLEAN write)
+{
+    UINT8 record[4096], *a;
+    UINT32 length;
+    int e = ntfs_record(v, ino, record);
+    if (e)
+        return e;
+    if (write) {
+        e = ntfs_regular_writable(v, ino, record);
+        if (e)
+            return e;
+    }
+    if (rd16(record + 22) & 2)
+        return K_EINVAL;
+    e = ntfs_attr(v, record, 0x80, "", &a, &length);
+    if (e)
+        return e;
+    if (!a[8]) {
+        UINT8 *bytes;
+        UINT32 len;
+        e = ntfs_value(a, length, &bytes, &len);
+        if (e)
+            return e;
+        *size = len;
+        if (offset >= len)
+            return n && write ? K_ENOTSUP : 0;
+        n = MIN(n, len - offset);
+        if (write) {
+            mem_copy(bytes + offset, buffer, n);
+            e = ntfs_dirty(v, TRUE);
+            if (!e)
+                e = ntfs_store_record(v, ino, record);
+            if (!e)
+                e = ntfs_dirty(v, FALSE);
+            if (e)
+                v->failed = TRUE;
+            return e;
+        }
+        mem_copy(buffer, bytes + offset, n);
+        return 0;
+    }
+    native_run runs[NATIVE_RUNS];
+    UINT32 count;
+    e = ntfs_runs(v, a, length, runs, &count);
+    if (e)
+        return e;
+    *size = rd64(a + 48);
+    if (offset >= *size)
+        return n && write ? K_ENOTSUP : 0;
+    n = MIN(n, *size - offset);
+    UINT64 initialized = rd64(a + 56);
+    if (write) {
+        if (ino < 24 || rd16(record + 18) != 1 || offset > initialized || n > initialized - offset)
+            return K_ENOTSUP;
+        /* Reject data runs overlapping the MFT allocation. */
+        for (UINT32 i = 0; i < count; ++i)
+            for (UINT32 j = 0; j < v->mft_runs; ++j)
+                if (!runs[i].hole && !v->mft[j].hole &&
+                    overlap(runs[i].physical, runs[i].length, v->mft[j].physical, v->mft[j].length))
+                    return K_EIO;
+        for (UINT32 i = 0; i < count; ++i)
+            if (runs[i].hole)
+                return K_ENOTSUP;
+    }
+    if (write) {
+        e = ntfs_data_boundaries(v, runs, count);
+        if (e)
+            return e;
+    }
+    UINT64 backed = offset < initialized ? MIN(n, initialized - offset) : 0;
+    if (backed)
+        e = run_io(v, runs, count, offset, buffer, backed, write);
+    if (!e && !write && n > backed)
+        mem_zero((UINT8 *)buffer + backed, n - backed);
+    return e;
+}
+static int ntfs_store_record(native_volume *v, UINT32 ino, const UINT8 *unpacked)
+{
+    UINT8 raw[4096];
+    mem_copy(raw, unpacked, v->record_size);
+    UINT32 usa = rd16(raw + 4), count = rd16(raw + 6);
+    if (count != v->record_size / 512 + 1 || usa < 8 || usa + count * 2 > v->record_size)
+        return K_EIO;
+    UINT16 sequence = (UINT16)(rd16(raw + usa) + 1);
+    if (!sequence || sequence == 0xffff)
+        sequence = 1;
+    wr16(raw + usa, sequence);
+    for (UINT32 i = 1; i < count; ++i) {
+        wr16(raw + usa + i * 2, rd16(raw + i * 512 - 2));
+        wr16(raw + i * 512 - 2, sequence);
+    }
+    int e = run_io(v, v->mft, v->mft_runs, (UINT64)ino * v->record_size, raw, v->record_size, TRUE);
+    UINT64 mirror = rd64(v->super + 56);
+    if (!e && ino < 4) {
+        if (!mirror || mirror >= v->blocks)
+            return K_EIO;
+        e = native_write_bytes(v, mirror * v->block + (UINT64)ino * v->record_size, raw,
+                               v->record_size);
+    }
+    return e;
+}
+static int ntfs_dirty(native_volume *v, BOOLEAN dirty)
+{
+    UINT8 raw[4096], *a, *value;
+    UINT32 n, size;
+    int e = ntfs_record(v, 3, raw);
+    if (e)
+        return e;
+    e = ntfs_attr(v, raw, 0x70, "", &a, &n);
+    if (e)
+        return e;
+    e = ntfs_value(a, n, &value, &size);
+    if (e)
+        return e;
+    if (size < 12)
+        return K_EIO;
+    UINT16 flags = rd16(value + 10);
+    if (flags & ~1u)
+        return K_EROFS;
+    wr16(value + 10, dirty ? (flags | 1) : (flags & ~1u));
+    return ntfs_store_record(v, 3, raw);
+}
+static int ntfs_regular_writable(native_volume *v, UINT32 ino, UINT8 *record)
+{
+    if (ino < 24 || rd16(record + 18) != 1 || (rd16(record + 22) & 2))
+        return K_ENOTSUP;
+    UINT8 *a, *value;
+    UINT32 n, size;
+    int e = ntfs_attr(v, record, 0x10, "", &a, &n);
+    if (e)
+        return e;
+    e = ntfs_value(a, n, &value, &size);
+    if (e)
+        return e;
+    /* Reject unsupported NTFS mutation flags. */
+    if (size < 36 || (rd32(value + 32) & (1u | 4u | 0x200u | 0x400u | 0x800u | 0x1000u | 0x4000u)))
+        return K_EROFS;
+    return 0;
+}
+static int ntfs_metadata_boundaries(native_volume *v, const native_run *runs, UINT32 count)
+{
+    /* Reserved MFT records may own nonresident metadata; include them in overlap checks. */
+    UINT8 raw[4096];
+    for (UINT32 ino = 0; ino < 24 && ino < v->mft_count; ++ino) {
+        int e = ntfs_record(v, ino, raw);
+        if (e) {
+            e = run_io(v, v->mft, v->mft_runs, (UINT64)ino * v->record_size, raw, v->record_size,
+                       FALSE);
+            if (e)
+                return e;
+            if (ntfs_fixup(v, raw, v->record_size, "FILE"))
+                return K_EIO;
+            if (!(rd16(raw + 22) & 1))
+                continue;
+            return K_ENOTSUP;
+        }
+        UINT32 at = rd16(raw + 20), used = rd32(raw + 24);
+        while (at + 4 <= used && rd32(raw + at) != 0xffffffff) {
+            UINT8 *a = raw + at;
+            UINT32 len = rd32(a + 4);
+            if (len < 24 || len > used - at || len & 7)
+                return K_EIO;
+            if (rd32(a) == 0x20)
+                return K_ENOTSUP;
+            if (a[8]) {
+                native_run protected[NATIVE_RUNS];
+                UINT32 pc;
+                /* $BadClus may be sparse; other unsupported encoding flags still reject. */
+                UINT16 flags = rd16(a + 12);
+                wr16(a + 12, flags & ~0x8000u);
+                e = ntfs_runs(v, a, len, protected, &pc);
+                wr16(a + 12, flags);
+                if (e)
+                    return e;
+                for (UINT32 i = 0; i < count; ++i)
+                    for (UINT32 j = 0; j < pc; ++j)
+                        if (!runs[i].hole && !protected[j].hole &&
+                            overlap(runs[i].physical, runs[i].length, protected[j].physical,
+                                    protected[j].length))
+                            return K_EIO;
+            }
+            at += len;
+        }
+    }
+    return 0;
+}
+static int ntfs_data_boundaries(native_volume *v, const native_run *runs, UINT32 count)
+{
+    int checked = ntfs_metadata_boundaries(v, runs, count);
+    if (checked)
+        return checked;
+    /* Verify each NTFS data run against $Bitmap. */
+    UINT64 bitmap_size;
+    UINT8 bit;
+    for (UINT32 i = 0; i < count; ++i) {
+        if (runs[i].hole)
+            return K_ENOTSUP;
+        if (runs[i].physical + runs[i].length >= v->blocks)
+            return K_EIO;
+        for (UINT64 c = runs[i].physical; c < runs[i].physical + runs[i].length; ++c) {
+            int e = ntfs_data(v, 6, c / 8, &bit, 1, &bitmap_size, FALSE);
+            if (e)
+                return e;
+            if (c / 8 >= bitmap_size || !(bit & (1u << (c % 8))))
+                return K_EIO;
+        }
+    }
+    return 0;
+}
+
+static int ntfs_name(const UINT8 *key, UINT32 n, char out[256])
+{
+    if (n < 66 || 66u + 2u * key[64] > n)
+        return K_EIO;
+    UINT32 len = key[64];
+    for (UINT32 i = 0; i < len; ++i) {
+        UINT16 c = rd16(key + 66 + i * 2);
+        if (c < 32 || c > 126 || c == '/')
+            return K_ENOTSUP;
+        out[i] = (char)c;
+    }
+    out[len] = 0;
+    return len ? 0 : K_EIO;
+}
+static BOOLEAN ntfs_name_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        UINT8 x = (UINT8)*a++, y = (UINT8)*b++;
+        if (x >= 'a' && x <= 'z')
+            x -= 32;
+        if (y >= 'a' && y <= 'z')
+            y -= 32;
+        if (x != y)
+            return FALSE;
+    }
+    return !*a && !*b;
+}
+static int ntfs_index_entries(native_volume *v, const UINT8 *header, UINT32 capacity,
+                              const char *wanted, k_file *found, k_dir_callback cb, void *arg)
+{
+    if (capacity < 16)
+        return K_EIO;
+    UINT32 off = rd32(header), size = rd32(header + 4), alloc = rd32(header + 8);
+    if (off < 16 || size < off || size > alloc || alloc > capacity)
+        return K_EIO;
+    for (UINT32 at = off; at + 16 <= size;) {
+        const UINT8 *entry = header + at;
+        UINT32 len = rd16(entry + 8), keylen = rd16(entry + 10), flags = rd16(entry + 12);
+        if (len < 16 + ((flags & 1) ? 8u : 0u) || (len & 7) || len > size - at || (flags & ~3) ||
+            keylen > len - 16 - ((flags & 1) ? 8 : 0))
+            return K_EIO;
+        if (flags & 2)
+            return 0;
+        char name[256];
+        int e = ntfs_name(entry + 16, keylen, name);
+        if (e != K_ENOTSUP && e)
+            return e;
+        if (!e) {
+            UINT64 reference = rd64(entry), ino = reference & 0xffffffffffffULL;
+            if (ino > 0xffffffff)
+                return K_ENOTSUP;
+            if (wanted && ntfs_name_equal(name, wanted)) {
+                UINT8 raw[4096];
+                e = ntfs_record(v, (UINT32)ino, raw);
+                if (e)
+                    return e;
+                if (rd16(raw + 16) != (reference >> 48))
+                    return K_EIO;
+                UINT32 attrs = rd32(entry + 16 + 56);
+                if (attrs & 0x400)
+                    return K_ENOTSUP;
+                *found = (k_file){5,
+                                  (UINT32)(v - native_volumes),
+                                  (UINT32)ino,
+                                  (rd16(raw + 22) & 2) ? 0x10 : 0,
+                                  rd64(entry + 16 + 48),
+                                  reference >> 48};
+                if (!(found->attributes & 0x10)) {
+                    UINT64 actual;
+                    e = ntfs_data(v, (UINT32)ino, 0, NULL, 0, &actual, FALSE);
+                    if (e)
+                        return e;
+                    found->size = actual;
+                }
+                return 1;
+            }
+            if (cb && entry[16 + 65] != 2) {
+                k_dirent d;
+                mem_zero(&d, sizeof(d));
+                str_copy(d.name, name, sizeof(d.name));
+                d.size = rd64(entry + 16 + 48);
+                d.directory = (rd32(entry + 16 + 56) & 0x10000000) != 0;
+                cb(&d, arg);
+            }
+        }
+        at += len;
+    }
+    return K_EIO;
+}
+static int ntfs_directory(native_volume *v, UINT32 ino, const char *name, k_file *found,
+                          k_dir_callback cb, void *arg)
+{
+    UINT8 record[4096], *attr, *value;
+    UINT32 length, bytes;
+    int e = ntfs_record(v, ino, record);
+    if (e)
+        return e;
+    if (!(rd16(record + 22) & 2))
+        return K_EINVAL;
+    e = ntfs_attr(v, record, 0x90, "$I30", &attr, &length);
+    if (e)
+        return e;
+    e = ntfs_value(attr, length, &value, &bytes);
+    if (e)
+        return e;
+    if (bytes < 32 || rd32(value) != 0x30 || rd32(value + 4) != 1 ||
+        rd32(value + 8) != v->index_size)
+        return K_ENOTSUP;
+    e = ntfs_index_entries(v, value + 16, bytes - 16, name, found, cb, arg);
+    if (e)
+        return e == 1 ? 0 : e;
+    e = ntfs_attr(v, record, 0xa0, "$I30", &attr, &length);
+    if (e == K_ENOENT)
+        return name ? K_ENOENT : 0;
+    if (e)
+        return e;
+    native_run runs[NATIVE_RUNS];
+    UINT32 count;
+    e = ntfs_runs(v, attr, length, runs, &count);
+    if (e)
+        return e;
+    UINT64 size = rd64(attr + 48);
+    if (size > NATIVE_SCAN_MAX || size % v->index_size)
+        return K_ENOTSUP;
+    UINT8 *bitmap_attr;
+    UINT32 bitmap_len;
+    e = ntfs_attr(v, record, 0xb0, "$I30", &bitmap_attr, &bitmap_len);
+    if (e)
+        return e;
+    UINT8 bitmap[4096];
+    UINT32 bitmap_size;
+    if (!bitmap_attr[8]) {
+        UINT8 *p;
+        e = ntfs_value(bitmap_attr, bitmap_len, &p, &bitmap_size);
+        if (e)
+            return e;
+        if (bitmap_size > sizeof(bitmap))
+            return K_ENOTSUP;
+        mem_copy(bitmap, p, bitmap_size);
+    } else {
+        native_run br[NATIVE_RUNS];
+        UINT32 bn;
+        e = ntfs_runs(v, bitmap_attr, bitmap_len, br, &bn);
+        if (e)
+            return e;
+        if (rd64(bitmap_attr + 48) > sizeof(bitmap))
+            return K_ENOTSUP;
+        bitmap_size = (UINT32)rd64(bitmap_attr + 48);
+        e = run_io(v, br, bn, 0, bitmap, bitmap_size, FALSE);
+        if (e)
+            return e;
+    }
+    if (size / v->index_size > (UINT64)bitmap_size * 8)
+        return K_EIO;
+    UINT8 block[4096];
+    for (UINT64 off = 0; off < size; off += v->index_size) {
+        UINT32 bit = (UINT32)(off / v->index_size);
+        if (!(bitmap[bit / 8] & (1u << (bit % 8))))
+            continue;
+        e = run_io(v, runs, count, off, block, v->index_size, FALSE);
+        if (e)
+            return e;
+        e = ntfs_fixup(v, block, v->index_size, "INDX");
+        if (e)
+            return e;
+        e = ntfs_index_entries(v, block + 24, v->index_size - 24, name, found, cb, arg);
+        if (e)
+            return e == 1 ? 0 : e;
+    }
+    return name ? K_ENOENT : 0;
+}
+static int native_open(UINT32 index, const char *path, k_file *out)
+{
+    if (index >= native_count)
+        return K_ENOENT;
+    native_volume *v = &native_volumes[index];
+    k_file cur = {v->kind, index, v->kind == 4 ? 2 : 5, 0x10, 0, 0};
+    while (*path) {
+        while (*path == '/')
+            ++path;
+        if (!*path)
+            break;
+        char name[256];
+        UINT32 n = 0;
+        while (*path && *path != '/') {
+            if (n == 255)
+                return K_E2BIG;
+            name[n++] = *path++;
+        }
+        name[n] = 0;
+        int e = v->kind == 4 ? ext_directory(v, cur.cluster, name, &cur, NULL, NULL)
+                             : ntfs_directory(v, cur.cluster, name, &cur, NULL, NULL);
+        if (e)
+            return e;
+    }
+    *out = cur;
+    return 0;
+}
+static int native_refresh(k_file *f)
+{
+    if (f->object >= native_count)
+        return K_EINVAL;
+    native_volume *v = &native_volumes[f->object];
+    UINT8 raw[4096];
+    if (v->kind == 4) {
+        int e = ext_inode(v, f->cluster, raw);
+        if (e)
+            return e;
+        if (rd32(raw + 100) != f->directory_offset)
+            return K_ENOENT;
+        f->size = ext_size(raw);
+    } else {
+        int e = ntfs_record(v, f->cluster, raw);
+        if (e)
+            return e;
+        if (rd16(raw + 16) != f->directory_offset)
+            return K_ENOENT;
+        UINT64 size;
+        e = ntfs_data(v, f->cluster, 0, NULL, 0, &size, FALSE);
+        if (e)
+            return e;
+        f->size = size;
+    }
+    return 0;
+}
+int k_vfs_stat(k_file *f)
+{
+    if (!f)
+        return K_EINVAL;
+    int e = k_mutex_lock(&vfs_mutex);
+    if (e)
+        return e;
+    if (f->kind == 1) {
+        if (f->object >= MAX_NODES || !nodes[f->object].used)
+            e = K_ENOENT;
+        else
+            f->size = nodes[f->object].size;
+    } else if (f->kind == 2)
+        e = fat_refresh(f);
+    else if (f->kind == 4 || f->kind == 5)
+        e = native_refresh(f);
+    else if (f->kind != 3 || f->object >= k_disk_count())
+        e = K_EINVAL;
+    k_mutex_unlock(&vfs_mutex);
+    return e;
+}
+static int native_read(const k_file *f, UINT64 offset, void *out, UINT64 n, UINT64 *got)
+{
+    if (f->object >= native_count || f->attributes & 0x10)
+        return K_EINVAL;
+    native_volume *v = &native_volumes[f->object];
+    *got = 0;
+    if (v->kind == 4) {
+        UINT8 raw[512];
+        int e = ext_inode(v, f->cluster, raw);
+        if (e)
+            return e;
+        if (rd32(raw + 100) != f->directory_offset)
+            return K_ENOENT;
+        UINT64 size = ext_size(raw);
+        if (offset >= size)
+            return 0;
+        n = MIN(n, size - offset);
+        native_run runs[NATIVE_RUNS];
+        UINT32 count;
+        e = ext_map(v, f->cluster, raw, runs, &count);
+        if (!e)
+            e = run_io(v, runs, count, offset, out, n, FALSE);
+        if (!e)
+            *got = n;
+        return e;
+    }
+    k_file refreshed = *f;
+    int e = native_refresh(&refreshed);
+    if (e)
+        return e;
+    UINT64 size;
+    e = ntfs_data(v, f->cluster, offset, out, n, &size, FALSE);
+    if (!e && offset < size)
+        *got = MIN(n, size - offset);
+    return e;
+}
+static int native_list(const k_file *f, k_dir_callback cb, void *arg)
+{
+    if (f->object >= native_count)
+        return K_EINVAL;
+    native_volume *v = &native_volumes[f->object];
+    return v->kind == 4 ? ext_directory(v, f->cluster, NULL, NULL, cb, arg)
+                        : ntfs_directory(v, f->cluster, NULL, NULL, cb, arg);
+}
+static int native_clean(native_volume *v)
+{
+    if (v->read_only || v->failed)
+        return K_EROFS;
+    if (v->kind == 4) {
+        UINT8 super[1024];
+        int e = native_bytes(v, 1024, super, 1024);
+        if (e)
+            return e;
+        if (rd16(super + 56) != 0xef53 || rd16(super + 58) != 1 || rd32(super + 96) & 4 ||
+            rd32(super + 232) || memcmp(super + 104, v->super + 104, 16))
+            return K_EROFS;
+        if (v->csum && crc32c_step(0xffffffff, super, 1020) != rd32(super + 1020))
+            return K_EIO;
+    } else {
+        UINT8 record[4096], *a, *value;
+        UINT32 len, n;
+        int e = ntfs_record(v, 3, record);
+        if (e)
+            return e;
+        e = ntfs_attr(v, record, 0x70, "", &a, &len);
+        if (e)
+            return e;
+        e = ntfs_value(a, len, &value, &n);
+        if (e)
+            return e;
+        if (n < 12 || rd16(value + 10))
+            return K_EROFS;
+        k_file hiber;
+        e = ntfs_directory(v, 5, "hiberfil.sys", &hiber, NULL, NULL);
+        if (!e) {
+            UINT8 header[4096];
+            UINT64 got;
+            e = native_read(&hiber, 0, header, sizeof(header), &got);
+            if (e)
+                return K_EROFS;
+            /* Never clear an active or unrecognized hibernation header. */
+            for (UINT64 i = 0; i < got; ++i)
+                if (header[i])
+                    return K_EROFS;
+        } else if (e != K_ENOENT)
+            return K_EROFS;
+    }
+    return disk_flush(v->disk);
+}
+static int native_write(k_file *f, UINT64 offset, const void *data, UINT64 n, UINT64 *written)
+{
+    *written = 0;
+    if (f->object >= native_count || f->attributes & 0x10)
+        return K_EINVAL;
+    native_volume *v = &native_volumes[f->object];
+    int refresh = native_refresh(f);
+    if (refresh)
+        return refresh;
+    if (offset == ~0ULL)
+        offset = f->size;
+    if ((v->kind == 4 || v->kind == 5) && f->size <= 4 * 1024 * 1024 && offset <= 4 * 1024 * 1024 &&
+        n <= 4 * 1024 * 1024 - offset) {
+        if (!n)
+            return 0;
+        UINT64 size = (f->size > offset + n ? f->size : offset + n);
+        UINT32 pages = (UINT32)((size + 4095) / 4096);
+        UINT64 memory = k_pmm_alloc_pages(pages, 0);
+        if (!memory)
+            return K_ENOMEM;
+        UINT64 got = 0;
+        int result = native_read(f, 0, (void *)(UINTN)memory, f->size, &got);
+        if (!result && got != f->size)
+            result = K_EIO;
+        if (!result) {
+            mem_copy((UINT8 *)(UINTN)memory + offset, data, n);
+            result = v->kind == 4 ? ext_replace(f, (void *)(UINTN)memory, size)
+                                  : ntfs_replace(f, (void *)(UINTN)memory, size);
+        }
+        k_pmm_free_pages(memory, pages);
+        if (!result)
+            *written = n;
+        return result;
+    }
+    if (offset > f->size || n > f->size - offset)
+        return K_ENOTSUP;
+    if (!n)
+        return 0;
+    int e = native_clean(v);
+    if (e)
+        return e;
+    if (v->kind == 5) {
+        UINT64 size;
+        e = ntfs_data(v, f->cluster, offset, (void *)data, n, &size, TRUE);
+        if (!e)
+            *written = n;
+        return e;
+    }
+    UINT8 raw[512];
+    e = ext_inode(v, f->cluster, raw);
+    if (e)
+        return e;
+    if ((rd16(raw) & 0xf000) != 0x8000 || f->cluster < rd32(v->super + 84) || rd16(raw + 26) != 1 ||
+        rd32(raw + 32) & (0x10 | 0x20 | 0x4000 | 0x100000 | 0x2000000))
+        return K_ENOTSUP;
+    if (rd32(raw + 100) != f->directory_offset || ext_size(raw) != f->size)
+        return K_ENOENT;
+    native_run runs[NATIVE_RUNS];
+    UINT32 count;
+    e = ext_map(v, f->cluster, raw, runs, &count);
+    if (e)
+        return e;
+    UINT64 first = offset / v->block, last = (offset + n - 1) / v->block;
+    for (UINT64 logical = first; logical <= last; ++logical) {
+        BOOLEAN found = FALSE;
+        for (UINT32 i = 0; i < count; ++i)
+            if (logical >= runs[i].logical && logical - runs[i].logical < runs[i].length &&
+                !runs[i].hole)
+                found = TRUE;
+        if (!found)
+            return K_ENOTSUP;
+    }
+    /* ext4 data extents must avoid every group's static metadata and have allocation bits set. */
+    for (UINT32 g = 0; g < v->groups; ++g) {
+        UINT8 d[64];
+        e = ext_group(v, g, d);
+        if (e)
+            return e;
+        UINT64 bb = ext_desc_block(v, d, 0), ib = ext_desc_block(v, d, 4),
+               it = ext_desc_block(v, d, 8);
+        UINT64 itn = ((UINT64)v->inodes_per_group * v->inode_size + v->block - 1) / v->block;
+        for (UINT32 i = 0; i < count; ++i)
+            if (!runs[i].hole && (overlap(runs[i].physical, runs[i].length, bb, 1) ||
+                                  overlap(runs[i].physical, runs[i].length, ib, 1) ||
+                                  overlap(runs[i].physical, runs[i].length, it, itn)))
+                return K_EIO;
+    }
+    UINT8 bitmap[4096];
+    UINT32 oldgroup = ~0u;
+    for (UINT32 i = 0; i < count; ++i) {
+        if (runs[i].hole)
+            return K_ENOTSUP;
+        for (UINT64 p = runs[i].physical; p < runs[i].physical + runs[i].length; ++p) {
+            UINT64 first_data = rd32(v->super + 20);
+            if (p < first_data)
+                return K_EIO;
+            UINT32 g = (UINT32)((p - first_data) / v->blocks_per_group),
+                   bit = (UINT32)((p - first_data) % v->blocks_per_group);
+            if (g != oldgroup) {
+                UINT8 d[64];
+                e = ext_group(v, g, d);
+                if (e)
+                    return e;
+                if (rd16(d + 18) & 2)
+                    return K_EIO;
+                UINT64 bb = ext_desc_block(v, d, 0);
+                e = native_bytes(v, bb * v->block, bitmap, v->block);
+                if (e)
+                    return e;
+                if (v->csum) {
+                    UINT32 wanted = rd16(d + 24);
+                    if (v->desc_size == 64)
+                        wanted |= (UINT32)rd16(d + 56) << 16;
+                    UINT32 crc = crc32c_step(v->csum_seed, bitmap, v->blocks_per_group / 8);
+                    if ((v->desc_size == 64 ? crc : (UINT16)crc) != wanted)
+                        return K_EIO;
+                }
+                oldgroup = g;
+            }
+            if (!(bitmap[bit / 8] & (1u << (bit % 8))))
+                return K_EIO;
+        }
+    }
+    e = run_io(v, runs, count, offset, (void *)data, n, TRUE);
+    if (!e)
+        *written = n;
+    return e;
+}
+static int native_probe(UINT32 disk_id, UINT64 start, UINT64 length, UINT32 partition, BOOLEAN ro)
+{
+    if (native_count == MAX_VOLUMES || mount_count == MAX_VOLUMES)
+        return K_E2BIG;
+    native_volume *v = &native_volumes[native_count];
+    mem_zero(v, sizeof(*v));
+    v->disk = disk_id;
+    v->sector = disks[disk_id].info.sector_size;
+    v->start = start;
+    v->length = length;
+    v->read_only = ro;
+    if (!length || start >= disks[disk_id].info.sectors ||
+        length > disks[disk_id].info.sectors - start)
+        return K_EINVAL;
+    UINT8 boot[4096];
+    int e = native_bytes(v, 0, boot, 512);
+    if (e)
+        return e;
+    if (!memcmp(boot + 3, "NTFS    ", 8)) {
+        v->kind = 5;
+        mem_copy(v->super, boot, 512);
+        UINT32 bps = rd16(boot + 11), spc = boot[13];
+        UINT64 sectors = rd64(boot + 40), mft = rd64(boot + 48);
+        if (bps != v->sector || !power2(spc) || spc > 128 || !sectors || sectors > length ||
+            boot[510] != 0x55 || boot[511] != 0xaa)
+            return K_ENOTSUP;
+        v->block = bps * spc;
+        v->blocks = sectors / spc;
+        INT8 rs = (INT8)boot[64], is = (INT8)boot[68];
+        if (!rs || !is || rs < -12 || is < -12)
+            return K_ENOTSUP;
+        v->record_size = rs < 0 ? (1u << -rs) : (UINT32)rs * v->block;
+        v->index_size = is < 0 ? (1u << -is) : (UINT32)is * v->block;
+        if (!power2(v->record_size) || v->record_size < 512 || v->record_size > 4096 ||
+            !power2(v->index_size) || v->index_size < 512 || v->index_size > 4096 || !mft ||
+            mft >= v->blocks)
+            return K_ENOTSUP;
+        e = native_bytes(v, mft * v->block, boot, v->record_size);
+        if (e)
+            return e;
+        e = ntfs_fixup(v, boot, v->record_size, "FILE");
+        if (e)
+            return e;
+        if (rd32(boot + 24) > v->record_size || rd16(boot + 20) < 48 ||
+            rd16(boot + 20) > rd32(boot + 24))
+            return K_EIO;
+        UINT8 *a;
+        UINT32 len;
+        e = ntfs_attr(v, boot, 0x80, "", &a, &len);
+        if (e)
+            return e;
+        e = ntfs_runs(v, a, len, v->mft, &v->mft_runs);
+        if (e)
+            return e;
+        v->mft_size = rd64(a + 56);
+        if (v->mft_size < v->record_size * 24ULL)
+            return K_ENOTSUP;
+        if (v->mft_size / v->record_size > 0xffffffff)
+            return K_ENOTSUP;
+        v->mft_count = (UINT32)(v->mft_size / v->record_size);
+    } else {
+        e = native_bytes(v, 1024, v->super, 1024);
+        if (e)
+            return e;
+        UINT8 *s = v->super;
+        if (rd16(s + 56) != 0xef53)
+            return K_ENOTSUP;
+        v->kind = 4;
+        UINT32 log = rd32(s + 24), incompat = rd32(s + 96), roc = rd32(s + 100);
+        if (log > 2 || rd32(s + 76) > 1 ||
+            (incompat & ~(2u | 0x40u | 0x80u | 0x200u | 0x2000u | 4u)) || rd32(s + 28) != log)
+            return K_ENOTSUP;
+        v->block = 1024u << log;
+        v->blocks = rd32(s + 4) | ((incompat & 0x80) ? (UINT64)rd32(s + 336) << 32 : 0);
+        v->inode_size = rd32(s + 76) ? rd16(s + 88) : 128;
+        v->inodes = rd32(s);
+        v->blocks_per_group = rd32(s + 32);
+        v->inodes_per_group = rd32(s + 40);
+        v->desc_size = (incompat & 0x80) ? rd16(s + 254) : 32;
+        v->csum = (roc & 0x400) != 0;
+        v->gdt_csum = (roc & 0x10) != 0;
+        if (!v->blocks || v->blocks > length * v->sector / v->block || !v->inodes ||
+            !v->blocks_per_group || v->blocks_per_group > 8 * v->block || v->blocks_per_group % 8 ||
+            !v->inodes_per_group || v->inodes_per_group > 8 * v->block || v->inode_size < 128 ||
+            v->inode_size > 512 || !power2(v->inode_size) ||
+            (v->desc_size != 32 && v->desc_size != 64) || rd32(s + 20) != (log ? 0u : 1u))
+            return K_ENOTSUP;
+        UINT64 groups = (v->blocks - rd32(s + 20) + v->blocks_per_group - 1) / v->blocks_per_group;
+        if (!groups || groups > 65536 || (UINT64)v->inodes > groups * v->inodes_per_group)
+            return K_ENOTSUP;
+        v->groups = (UINT32)groups;
+        v->csum_seed = (incompat & 0x2000) ? rd32(s + 624) : crc32c_step(0xffffffff, s + 104, 16);
+        if (v->csum && (s[373] != 1 || crc32c_step(0xffffffff, s, 1020) != rd32(s + 1020)))
+            return K_EIO;
+        if ((roc & ~(1u | 2u | 8u | 0x10u | 0x20u | 0x40u | 0x400u)) || rd16(s + 58) != 1 ||
+            (incompat & 4) || rd32(s + 232))
+            v->read_only = TRUE;
+    }
+    char source[24], num[12], path[K_PATH_MAX];
+    decimal_name(source, "disk", disk_id);
+    UINTN pos = str_len(source);
+    source[pos++] = 'p';
+    decimal_name(num, "", partition);
+    str_copy(source + pos, num, sizeof(source) - pos);
+    str_copy(path, "/volumes/", sizeof(path));
+    str_copy(path + 9, source, sizeof(path) - 9);
+    str_copy(v->source, source, sizeof(v->source));
+    e = k_vfs_mkdir(path);
+    if (e && e != K_EEXIST)
+        return e;
+    str_copy(mounts[mount_count].path, path, K_PATH_MAX);
+    mounts[mount_count].kind = v->kind;
+    mounts[mount_count].volume = native_count++;
+    __atomic_add_fetch(&mount_count, 1, __ATOMIC_RELEASE);
+    (void)k_root_bind(source, path);
+    decimal_name(num, "disk", disk_id);
+    (void)k_root_bind(num, path);
+    return 0;
+}
+
+/* ext4 writes require clean supported metadata, initialized bitmaps and a quiescent journal.
+ * Data is staged before metadata; I/O failure freezes writes. */
+#define EXT_TX_BLOCKS 128
+static struct {
+    UINT64 number;
+    UINT8 bytes[4096];
+} ext_tx_blocks[EXT_TX_BLOCKS];
+static UINT32 ext_tx_count;
+static native_volume *ext_tx_volume;
+static UINT8 *ext_tx_get(UINT64 block, int *error)
+{
+    native_volume *v = ext_tx_volume;
+    if (*error)
+        return NULL;
+    if (block >= v->blocks) {
+        *error = K_EIO;
+        return NULL;
+    }
+    for (UINT32 i = 0; i < ext_tx_count; ++i)
+        if (ext_tx_blocks[i].number == block)
+            return ext_tx_blocks[i].bytes;
+    if (ext_tx_count == EXT_TX_BLOCKS) {
+        *error = K_E2BIG;
+        return NULL;
+    }
+    UINT8 *p = ext_tx_blocks[ext_tx_count].bytes;
+    *error = native_bytes(v, block * v->block, p, v->block);
+    if (*error)
+        return NULL;
+    ext_tx_blocks[ext_tx_count++].number = block;
+    return p;
+}
+static UINT8 *ext_tx_desc(UINT32 group, int *e)
+{
+    native_volume *v = ext_tx_volume;
+    UINT8 checked[64];
+    if (!*e)
+        *e = ext_group(v, group, checked);
+    if (*e)
+        return NULL;
+    UINT64 at = (v->block == 1024 ? 2ULL : 1ULL) * v->block + (UINT64)group * v->desc_size;
+    UINT8 *b = ext_tx_get(at / v->block, e);
+    return b ? b + at % v->block : NULL;
+}
+static UINT8 *ext_tx_super(int *e)
+{
+    native_volume *v = ext_tx_volume;
+    UINT8 *b = ext_tx_get(1024 / v->block, e);
+    return b ? b + 1024 % v->block : NULL;
+}
+static void ext_desc_checksum(native_volume *v, UINT32 group, UINT8 *d)
+{
+    UINT8 g[4];
+    wr32(g, group);
+    wr16(d + 30, 0);
+    if (v->csum) {
+        UINT32 c = crc32c_step(v->csum_seed, g, 4);
+        wr16(d + 30, (UINT16)crc32c_step(c, d, v->desc_size));
+    } else if (v->gdt_csum) {
+        UINT16 c = crc16_step(0xffff, v->super + 104, 16);
+        c = crc16_step(c, g, 4);
+        c = crc16_step(c, d, 30);
+        if (v->desc_size > 32)
+            c = crc16_step(c, d + 32, v->desc_size - 32);
+        wr16(d + 30, c);
+    }
+}
+static UINT8 *ext_tx_bitmap(UINT32 group, BOOLEAN inode, UINT8 **desc, int *e)
+{
+    native_volume *v = ext_tx_volume;
+    UINT8 *d = ext_tx_desc(group, e);
+    if (!d)
+        return NULL;
+    if (rd16(d + 18) & (inode ? 1 : 2)) {
+        *e = K_ENOTSUP;
+        return NULL;
+    }
+    UINT64 block = ext_desc_block(v, d, inode ? 4 : 0);
+    UINT8 *b = ext_tx_get(block, e);
+    if (!b)
+        return NULL;
+    UINT32 bytes = (inode ? v->inodes_per_group : v->blocks_per_group) / 8;
+    if (v->csum) {
+        UINT32 wanted = rd16(d + (inode ? 26 : 24));
+        if (v->desc_size == 64)
+            wanted |= (UINT32)rd16(d + (inode ? 58 : 56)) << 16;
+        UINT32 crc = crc32c_step(v->csum_seed, b, bytes);
+        if ((v->desc_size == 64 ? crc : (UINT16)crc) != wanted) {
+            *e = K_EIO;
+            return NULL;
+        }
+    }
+    *desc = d;
+    return b;
+}
+static int ext_tx_bit(UINT64 number, BOOLEAN inode, BOOLEAN allocate)
+{
+    native_volume *v = ext_tx_volume;
+    UINT64 first = inode ? 1 : rd32(v->super + 20);
+    UINT32 per = inode ? v->inodes_per_group : v->blocks_per_group;
+    if (number < first)
+        return K_EIO;
+    UINT32 group = (UINT32)((number - first) / per), bit = (UINT32)((number - first) % per);
+    int e = 0;
+    UINT8 *d = NULL, *b = ext_tx_bitmap(group, inode, &d, &e);
+    if (e)
+        return e;
+    BOOLEAN old = (b[bit / 8] & (1u << (bit % 8))) != 0;
+    if (old == allocate)
+        return K_EIO;
+    UINT32 low = inode ? 14 : 12, high = inode ? 46 : 44;
+    UINT32 free = rd16(d + low) | (v->desc_size == 64 ? (UINT32)rd16(d + high) << 16 : 0);
+    if ((allocate && !free) || (!allocate && free >= per))
+        return K_EIO;
+    if (allocate)
+        b[bit / 8] |= (UINT8)(1u << (bit % 8));
+    else
+        b[bit / 8] &= (UINT8) ~(1u << (bit % 8));
+    free = allocate ? free - 1 : free + 1;
+    wr16(d + low, (UINT16)free);
+    if (v->desc_size == 64)
+        wr16(d + high, (UINT16)(free >> 16));
+    if (v->csum) {
+        UINT32 crc = crc32c_step(v->csum_seed, b, per / 8);
+        wr16(d + (inode ? 26 : 24), (UINT16)crc);
+        if (v->desc_size == 64)
+            wr16(d + (inode ? 58 : 56), (UINT16)(crc >> 16));
+    }
+    if (inode && allocate) {
+        UINT32 unused = rd16(d + 28) | (v->desc_size == 64 ? (UINT32)rd16(d + 50) << 16 : 0);
+        UINT32 now = per - bit - 1;
+        if (unused > now) {
+            wr16(d + 28, (UINT16)now);
+            if (v->desc_size == 64)
+                wr16(d + 50, (UINT16)(now >> 16));
+        }
+    }
+    ext_desc_checksum(v, group, d);
+    UINT8 *super = ext_tx_super(&e);
+    if (e)
+        return e;
+    if (inode) {
+        UINT32 n = rd32(super + 16);
+        if ((allocate && !n) || (!allocate && n == v->inodes))
+            return K_EIO;
+        wr32(super + 16, allocate ? n - 1 : n + 1);
+    } else {
+        UINT64 n =
+            rd32(super + 12) | ((rd32(super + 96) & 0x80) ? (UINT64)rd32(super + 344) << 32 : 0);
+        if ((allocate && !n) || (!allocate && n == v->blocks))
+            return K_EIO;
+        n = allocate ? n - 1 : n + 1;
+        wr32(super + 12, (UINT32)n);
+        if (rd32(super + 96) & 0x80)
+            wr32(super + 344, (UINT32)(n >> 32));
+    }
+    return 0;
+}
+static int ext_tx_allocate(BOOLEAN inode, UINT64 *number)
+{
+    native_volume *v = ext_tx_volume;
+    UINT32 per = inode ? v->inodes_per_group : v->blocks_per_group;
+    for (UINT32 g = 0; g < v->groups; ++g) {
+        int e = 0;
+        UINT8 *d = ext_tx_desc(g, &e);
+        if (e)
+            return e;
+        if (rd16(d + 18) & (inode ? 1 : 2))
+            continue;
+        UINT32 free = rd16(d + (inode ? 14 : 12)) |
+                      (v->desc_size == 64 ? (UINT32)rd16(d + (inode ? 46 : 44)) << 16 : 0);
+        if (!free)
+            continue;
+        UINT8 *b = ext_tx_bitmap(g, inode, &d, &e);
+        if (e)
+            return e;
+        for (UINT32 bit = 0; bit < per; ++bit) {
+            UINT64 n = (UINT64)g * per + bit + (inode ? 1 : rd32(v->super + 20));
+            if (inode ? (n > v->inodes) : (n >= v->blocks))
+                break;
+            if (inode && n < rd32(v->super + 84))
+                continue;
+            if (!(b[bit / 8] & (1u << (bit % 8)))) {
+                e = ext_tx_bit(n, inode, TRUE);
+                if (e)
+                    return e;
+                *number = n;
+                return 0;
+            }
+        }
+    }
+    return K_ENOSPC;
+}
+static void ext_set_size(UINT8 *raw, UINT64 size)
+{
+    wr32(raw + 4, (UINT32)size);
+    wr32(raw + 108, (UINT32)(size >> 32));
+}
+static void ext_inode_checksum(native_volume *v, UINT32 ino, UINT8 *raw)
+{
+    if (!v->csum)
+        return;
+    wr16(raw + 124, 0);
+    BOOLEAN high = v->inode_size >= 132 && rd16(raw + 128) >= 4;
+    if (high)
+        wr16(raw + 130, 0);
+    UINT32 crc = crc32c_step(ext_inode_seed(v, ino, raw), raw, v->inode_size);
+    wr16(raw + 124, (UINT16)crc);
+    if (high)
+        wr16(raw + 130, (UINT16)(crc >> 16));
+}
+static int ext_tx_inode(UINT32 ino, UINT8 *raw)
+{
+    native_volume *v = ext_tx_volume;
+    int e = 0;
+    UINT8 *d = ext_tx_desc((ino - 1) / v->inodes_per_group, &e);
+    if (e)
+        return e;
+    UINT64 pos = ext_desc_block(v, d, 8) * v->block +
+                 (UINT64)((ino - 1) % v->inodes_per_group) * v->inode_size;
+    UINT8 *b = ext_tx_get(pos / v->block, &e);
+    if (e)
+        return e;
+    if (v->inode_size > v->block - pos % v->block)
+        return K_EIO;
+    ext_inode_checksum(v, ino, raw);
+    mem_copy(b + pos % v->block, raw, v->inode_size);
+    return 0;
+}
+static void ext_inline_map(UINT8 *raw, const native_run *runs, UINT32 count, UINT32 blocksize)
+{
+    mem_zero(raw + 40, 60);
+    wr16(raw + 40, 0xf30a);
+    wr16(raw + 42, (UINT16)count);
+    wr16(raw + 44, 4);
+    UINT64 blocks = 0;
+    for (UINT32 i = 0; i < count; ++i) {
+        UINT8 *r = raw + 52 + 12 * i;
+        wr32(r, (UINT32)runs[i].logical);
+        wr16(r + 4, (UINT16)runs[i].length);
+        wr16(r + 6, (UINT16)(runs[i].physical >> 32));
+        wr32(r + 8, (UINT32)runs[i].physical);
+        blocks += runs[i].length;
+    }
+    wr32(raw + 32, rd32(raw + 32) | 0x80000);
+    wr32(raw + 28, (UINT32)(blocks * (blocksize / 512)));
+    wr16(raw + 116, 0);
+}
+static int ext_alloc_runs(UINT64 size, native_run runs[4], UINT32 *count)
+{
+    native_volume *v = ext_tx_volume;
+    *count = 0;
+    UINT64 blocks = (size + v->block - 1) / v->block;
+    for (UINT64 logical = 0; logical < blocks; ++logical) {
+        UINT64 physical;
+        int e = ext_tx_allocate(FALSE, &physical);
+        if (e)
+            return e;
+        if (*count && runs[*count - 1].physical + runs[*count - 1].length == physical &&
+            runs[*count - 1].length < 32768)
+            ++runs[*count - 1].length;
+        else {
+            if (*count == 4)
+                return K_ENOSPC;
+            runs[(*count)++] = (native_run){logical, physical, 1, FALSE};
+        }
+    }
+    return 0;
+}
+static BOOLEAN ext_has_super(native_volume *v, UINT32 group)
+{
+    UINT32 compat = rd32(v->super + 92), roc = rd32(v->super + 100);
+    if (!group)
+        return TRUE;
+    if (compat & 0x200)
+        return group == rd32(v->super + 588) || group == rd32(v->super + 592);
+    if (!(roc & 1) || group == 1)
+        return TRUE;
+    const UINT32 bases[3] = {3, 5, 7};
+    for (UINT32 i = 0; i < 3; ++i) {
+        UINT32 n = group;
+        while (n > 1 && n % bases[i] == 0)
+            n /= bases[i];
+        if (n == 1)
+            return TRUE;
+    }
+    return FALSE;
+}
+static int ext_data_boundaries(native_volume *v, const native_run *runs, UINT32 count)
+{
+
+    for (UINT32 g = 0; g < v->groups; ++g) {
+        UINT8 d[64];
+        int e = ext_group(v, g, d);
+        if (e)
+            return e;
+        UINT64 starts[4] = {ext_desc_block(v, d, 0), ext_desc_block(v, d, 4),
+                            ext_desc_block(v, d, 8),
+                            rd32(v->super + 20) + (UINT64)g * v->blocks_per_group};
+        UINT64 lengths[4] = {
+            1, 1, ((UINT64)v->inodes_per_group * v->inode_size + v->block - 1) / v->block,
+            ext_has_super(v, g) ? 1 + ((UINT64)v->groups * v->desc_size + v->block - 1) / v->block +
+                                      rd16(v->super + 206)
+                                : 0};
+        for (UINT32 j = 0; j < 4; ++j) {
+            if (lengths[j] && (!span_ok(starts[j], lengths[j], v->blocks)))
+                return K_EIO;
+            for (UINT32 i = 0; i < count; ++i)
+                if (!runs[i].hole && lengths[j] &&
+                    overlap(runs[i].physical, runs[i].length, starts[j], lengths[j]))
+                    return K_EIO;
+        }
+    }
+    if (rd32(v->super + 92) & 4) {
+        UINT8 raw[512];
+        UINT32 ino = rd32(v->super + 224);
+        int e = ext_inode(v, ino, raw);
+        if (e)
+            return e;
+        native_run jr[NATIVE_RUNS];
+        UINT32 jc;
+        e = ext_map(v, ino, raw, jr, &jc);
+        if (e)
+            return e;
+        for (UINT32 i = 0; i < count; ++i)
+            for (UINT32 j = 0; j < jc; ++j)
+                if (!runs[i].hole && !jr[j].hole &&
+                    overlap(runs[i].physical, runs[i].length, jr[j].physical, jr[j].length))
+                    return K_EIO;
+    }
+    return 0;
+}
+static int ext_prepare_metadata(native_volume *v)
+{
+    int e = native_clean(v);
+    if (e)
+        return e;
+    UINT32 compat = rd32(v->super + 92), roc = rd32(v->super + 100);
+    if (compat & ~(4u | 8u | 0x10u | 0x20u | 0x200u) ||
+        roc & ~(1u | 2u | 8u | 0x10u | 0x20u | 0x40u | 0x400u) || rd32(v->super + 228) ||
+        !(rd32(v->super + 96) & 2))
+        return K_ENOTSUP;
+    if (compat & 4) {
+        UINT32 ino = rd32(v->super + 224);
+        UINT8 raw[512], journal[32];
+        e = ext_inode(v, ino, raw);
+        if (e)
+            return e;
+        native_run runs[NATIVE_RUNS];
+        UINT32 count;
+        e = ext_map(v, ino, raw, runs, &count);
+        if (e)
+            return e;
+        e = run_io(v, runs, count, 0, journal, 32, FALSE);
+        if (e)
+            return e;
+        /* JBD2 superblock is big-endian; s_start=0 means no live transaction. */
+        if (journal[0] != 0xc0 || journal[1] != 0x3b || journal[2] != 0x39 || journal[3] != 0x98 ||
+            journal[7] != 4 || rd32(journal + 28))
+            return K_EROFS;
+    }
+    ext_tx_volume = v;
+    ext_tx_count = 0;
+    return 0;
+}
+static int ext_commit(native_volume *v, const native_run *fresh, UINT32 count, const void *data,
+                      UINT64 size)
+{
+    int e = 0;
+    UINT8 *s = ext_tx_super(&e);
+    if (e)
+        return e;
+    UINT8 dirty[1024];
+    mem_copy(dirty, v->super, 1024);
+    wr16(dirty + 58, 0);
+    if (v->csum)
+        wr32(dirty + 1020, crc32c_step(0xffffffff, dirty, 1020));
+    e = native_write_bytes(v, 1024, dirty, 1024);
+    if (e)
+        return e;
+    UINT8 block[4096];
+    UINT64 offset = 0;
+    for (UINT32 i = 0; !e && i < count; ++i)
+        for (UINT64 j = 0; !e && j < fresh[i].length; ++j) {
+            mem_zero(block, v->block);
+            UINT64 n = offset < size ? MIN(size - offset, v->block) : 0;
+            if (n)
+                mem_copy(block, (const UINT8 *)data + offset, n);
+            e = native_write_bytes(v, (fresh[i].physical + j) * v->block, block, v->block);
+            offset += n;
+        }
+    /* Keep the primary ext4 superblock dirty until staged metadata is durable. */
+    wr16(s + 58, 0);
+    if (v->csum)
+        wr32(s + 1020, crc32c_step(0xffffffff, s, 1020));
+    for (UINT32 i = 0; !e && i < ext_tx_count; ++i)
+        e = native_write_bytes(v, ext_tx_blocks[i].number * v->block, ext_tx_blocks[i].bytes,
+                               v->block);
+    if (e) {
+        v->failed = TRUE;
+        return e;
+    }
+    wr16(s + 58, 1);
+    if (v->csum)
+        wr32(s + 1020, crc32c_step(0xffffffff, s, 1020));
+    e = native_write_bytes(v, 1024, s, 1024);
+    if (!e)
+        mem_copy(v->super, s, 1024);
+    else
+        v->failed = TRUE;
+    return e;
+}
+static int ext_replace(k_file *f, const void *bytes, UINT64 size)
+{
+    native_volume *v = &native_volumes[f->object];
+    if (size > 4 * 1024 * 1024)
+        return K_E2BIG;
+    UINT8 raw[512];
+    int e = ext_inode(v, f->cluster, raw);
+    if (e)
+        return e;
+    if ((rd16(raw) & 0xf000) != 0x8000 || f->cluster < rd32(v->super + 84) || rd16(raw + 26) != 1 ||
+        rd32(raw + 100) != f->directory_offset || rd32(raw + 32) & ~0x80000u ||
+        !(rd32(raw + 32) & 0x80000) || rd16(raw + 46) || rd32(raw + 104) || rd16(raw + 118))
+        return K_ENOTSUP;
+    native_run old[NATIVE_RUNS];
+    UINT32 oldn;
+    e = ext_map(v, f->cluster, raw, old, &oldn);
+    if (e)
+        return e;
+    e = ext_data_boundaries(v, old, oldn);
+    if (e)
+        return e;
+    e = ext_prepare_metadata(v);
+    if (e)
+        return e;
+    native_run fresh[4];
+    UINT32 count;
+    e = ext_alloc_runs(size, fresh, &count);
+    if (e)
+        return e;
+    e = ext_data_boundaries(v, fresh, count);
+    if (e)
+        return e;
+    for (UINT32 i = 0; i < oldn; ++i)
+        for (UINT32 j = 0; j < count; ++j)
+            if (overlap(old[i].physical, old[i].length, fresh[j].physical, fresh[j].length))
+                return K_EIO;
+    for (UINT32 i = 0; i < oldn; ++i)
+        for (UINT64 j = 0; j < old[i].length; ++j) {
+            e = ext_tx_bit(old[i].physical + j, FALSE, FALSE);
+            if (e)
+                return e;
+        }
+    ext_inline_map(raw, fresh, count, v->block);
+    ext_set_size(raw, size);
+    e = ext_tx_inode(f->cluster, raw);
+    if (e)
+        return e;
+    e = ext_commit(v, fresh, count, bytes, size);
+    if (!e)
+        f->size = size;
+    return e;
+}
+static int ext_add_dirent(native_volume *v, UINT32 parent, UINT8 *raw, const char *name,
+                          UINT32 inode, BOOLEAN directory)
+{
+    UINT32 namelen = (UINT32)str_len(name), needed = (8 + namelen + 3) & ~3u;
+    if (!namelen || namelen > 255 || rd32(raw + 32) & ~0x80000u || !(rd32(raw + 32) & 0x80000) ||
+        rd16(raw + 46))
+        return K_ENOTSUP;
+    native_run runs[NATIVE_RUNS];
+    UINT32 count;
+    int e = ext_map(v, parent, raw, runs, &count);
+    if (e)
+        return e;
+    UINT64 size = ext_size(raw);
+    if (size > NATIVE_SCAN_MAX || size % v->block)
+        return K_ENOTSUP;
+    for (UINT32 i = 0; i < count; ++i)
+        for (UINT64 j = 0; j < runs[i].length; ++j) {
+            if (runs[i].hole)
+                return K_EIO;
+            UINT8 *b = ext_tx_get(runs[i].physical + j, &e);
+            if (e)
+                return e;
+            UINT32 limit = v->block - (v->csum ? 12 : 0), at = 0;
+            if (v->csum &&
+                (rd32(b + limit) || rd16(b + limit + 4) != 12 || b[limit + 7] != 0xde ||
+                 crc32c_step(ext_inode_seed(v, parent, raw), b, limit) != rd32(b + limit + 8)))
+                return K_EIO;
+            while (at < limit) {
+                if (limit - at < 8)
+                    return K_EIO;
+                UINT32 rec = rd16(b + at + 4), len = b[at + 6];
+                if (rec < 8 || (rec & 3) || rec > limit - at || len > rec - 8)
+                    return K_EIO;
+                UINT32 used = rd32(b + at) ? (8 + len + 3) & ~3u : 0;
+                if (rec - used >= needed) {
+                    UINT32 target = at + used;
+                    if (used)
+                        wr16(b + at + 4, (UINT16)used);
+                    mem_zero(b + target, rec - used);
+                    wr32(b + target, inode);
+                    wr16(b + target + 4, (UINT16)(rec - used));
+                    b[target + 6] = (UINT8)namelen;
+                    b[target + 7] = directory ? 2 : 1;
+                    mem_copy(b + target + 8, name, namelen);
+                    if (v->csum)
+                        wr32(b + limit + 8, crc32c_step(ext_inode_seed(v, parent, raw), b, limit));
+                    return 0;
+                }
+                at += rec;
+            }
+        }
+    /* Do not fake HTree splitting or directory growth. */
+    return K_ENOSPC;
+}
+static int ext_create(UINT32 index, const char *path, BOOLEAN directory, const void *data,
+                      UINT64 size, k_file *out)
+{
+    if (index >= native_count || size > 4 * 1024 * 1024)
+        return K_EINVAL;
+    native_volume *v = &native_volumes[index];
+    char parent_path[K_PATH_MAX], name[256];
+    str_copy(parent_path, path, sizeof(parent_path));
+    UINTN end = str_len(parent_path), split = end;
+    while (split && parent_path[split - 1] != '/')
+        --split;
+    str_copy(name, parent_path + split, sizeof(name));
+    parent_path[split ? split - 1 : 0] = 0;
+    k_file parent;
+    int e = native_open(index, parent_path, &parent);
+    if (e)
+        return e;
+    if (!(parent.attributes & 0x10))
+        return K_EINVAL;
+    k_file existing;
+    e = ext_directory(v, parent.cluster, name, &existing, NULL, NULL);
+    if (!e)
+        return K_EEXIST;
+    if (e != K_ENOENT)
+        return e;
+    UINT8 praw[512];
+    e = ext_inode(v, parent.cluster, praw);
+    if (e)
+        return e;
+    if (rd16(praw + 26) >= 65000)
+        return K_E2BIG;
+    e = ext_prepare_metadata(v);
+    if (e)
+        return e;
+    UINT64 inode;
+    e = ext_tx_allocate(TRUE, &inode);
+    if (e)
+        return e;
+    UINT8 raw[512];
+    mem_zero(raw, sizeof(raw));
+    wr16(raw, directory ? 0x41ed : 0x81a4);
+    wr16(raw + 26, directory ? 2 : 1);
+    wr32(raw + 100, (UINT32)(rdtsc() ^ inode));
+    if (v->inode_size >= 160)
+        wr16(raw + 128, 32);
+    native_run fresh[4];
+    UINT32 count;
+    UINT64 stored = directory ? v->block : size;
+    e = ext_alloc_runs(stored, fresh, &count);
+    if (e)
+        return e;
+    e = ext_data_boundaries(v, fresh, count);
+    if (e)
+        return e;
+    native_run parent_runs[NATIVE_RUNS];
+    UINT32 pn;
+    e = ext_map(v, parent.cluster, praw, parent_runs, &pn);
+    if (e)
+        return e;
+    for (UINT32 i = 0; i < pn; ++i)
+        for (UINT32 j = 0; j < count; ++j)
+            if (overlap(parent_runs[i].physical, parent_runs[i].length, fresh[j].physical,
+                        fresh[j].length))
+                return K_EIO;
+    ext_inline_map(raw, fresh, count, v->block);
+    ext_set_size(raw, stored);
+    UINT8 contents[4096];
+    const void *initial = data;
+    if (directory) {
+        mem_zero(contents, v->block);
+        UINT32 limit = v->block - (v->csum ? 12 : 0);
+        wr32(contents, (UINT32)inode);
+        wr16(contents + 4, 12);
+        contents[6] = 1;
+        contents[7] = 2;
+        contents[8] = '.';
+        wr32(contents + 12, parent.cluster);
+        wr16(contents + 16, (UINT16)(limit - 12));
+        contents[18] = 2;
+        contents[19] = 2;
+        contents[20] = contents[21] = '.';
+        if (v->csum) {
+            wr16(contents + limit + 4, 12);
+            contents[limit + 7] = 0xde;
+            wr32(contents + limit + 8,
+                 crc32c_step(ext_inode_seed(v, (UINT32)inode, raw), contents, limit));
+        }
+        initial = contents;
+        wr16(praw + 26, rd16(praw + 26) + 1);
+        int de = 0;
+        UINT32 g = ((UINT32)inode - 1) / v->inodes_per_group;
+        UINT8 *d = ext_tx_desc(g, &de);
+        if (de)
+            return de;
+        UINT32 used = rd16(d + 16) | (v->desc_size == 64 ? (UINT32)rd16(d + 48) << 16 : 0);
+        if (used >= v->inodes_per_group)
+            return K_EIO;
+        ++used;
+        wr16(d + 16, (UINT16)used);
+        if (v->desc_size == 64)
+            wr16(d + 48, (UINT16)(used >> 16));
+        ext_desc_checksum(v, g, d);
+    }
+    e = ext_add_dirent(v, parent.cluster, praw, name, (UINT32)inode, directory);
+    if (e)
+        return e;
+    e = ext_tx_inode((UINT32)inode, raw);
+    if (e)
+        return e;
+    e = ext_tx_inode(parent.cluster, praw);
+    if (e)
+        return e;
+    e = ext_commit(v, fresh, count, initial, stored);
+    if (!e && out)
+        *out = (k_file){4, index, (UINT32)inode, directory ? 0x10 : 0, stored, rd32(raw + 100)};
+    return e;
+}
+
+/* NTFS writes reuse existing MFT/index capacity; no MFT growth, attribute-list extension or index split. */
+#define NT_TX_SECTORS 128
+static struct {
+    UINT64 lba;
+    UINT8 bytes[4096];
+} nt_tx[NT_TX_SECTORS];
+static UINT32 nt_tx_count;
+static native_volume *nt_tx_volume;
+static int nt_tx_bytes(UINT64 offset, void *bytes, UINT64 length, BOOLEAN write)
+{
+    native_volume *v = nt_tx_volume;
+    if (!span_ok(offset, length, v->length * v->sector))
+        return K_EIO;
+    UINT8 *p = bytes;
+    while (length) {
+        UINT64 lba = offset / v->sector;
+        UINT32 at = (UINT32)(offset % v->sector), n = (UINT32)MIN(length, v->sector - at), i;
+        for (i = 0; i < nt_tx_count; ++i)
+            if (nt_tx[i].lba == lba)
+                break;
+        if (i == nt_tx_count) {
+            if (!write) {
+                int e = native_bytes(v, offset, p, n);
+                if (e)
+                    return e;
+                goto next;
+            }
+            if (nt_tx_count == NT_TX_SECTORS)
+                return K_E2BIG;
+            int e = native_bytes(v, lba * v->sector, nt_tx[i].bytes, v->sector);
+            if (e)
+                return e;
+            nt_tx[i].lba = lba;
+            ++nt_tx_count;
+        }
+        if (write)
+            mem_copy(nt_tx[i].bytes + at, p, n);
+        else
+            mem_copy(p, nt_tx[i].bytes + at, n);
+    next:
+        p += n;
+        offset += n;
+        length -= n;
+    }
+    return 0;
+}
+static int nt_tx_stream(const native_run *runs, UINT32 count, UINT64 offset, void *bytes,
+                        UINT64 length, BOOLEAN write)
+{
+    native_volume *v = nt_tx_volume;
+    UINT8 *p = bytes;
+    while (length) {
+        UINT64 logical = offset / v->block, at = offset % v->block, n = MIN(length, v->block - at);
+        const native_run *r = NULL;
+        for (UINT32 i = 0; i < count; ++i)
+            if (logical >= runs[i].logical && logical - runs[i].logical < runs[i].length) {
+                r = &runs[i];
+                break;
+            }
+        if (!r || r->hole)
+            return K_ENOTSUP;
+        int e = nt_tx_bytes((r->physical + logical - r->logical) * v->block + at, p, n, write);
+        if (e)
+            return e;
+        p += n;
+        offset += n;
+        length -= n;
+    }
+    return 0;
+}
+static int nt_tx_record(UINT32 ino, UINT8 *raw)
+{
+    native_volume *v = nt_tx_volume;
+    UINT32 usa = rd16(raw + 4), count = rd16(raw + 6);
+    if (usa < 48 || count != v->record_size / 512 + 1 || usa + count * 2 > v->record_size)
+        return K_EIO;
+    UINT8 packed[4096];
+    mem_copy(packed, raw, v->record_size);
+    UINT16 sequence = (UINT16)(rd16(raw + usa) + 1);
+    if (!sequence || sequence == 0xffff)
+        sequence = 1;
+    wr16(packed + usa, sequence);
+    for (UINT32 i = 1; i < count; ++i) {
+        wr16(packed + usa + i * 2, rd16(packed + i * 512 - 2));
+        wr16(packed + i * 512 - 2, sequence);
+    }
+    int e = nt_tx_stream(v->mft, v->mft_runs, (UINT64)ino * v->record_size, packed, v->record_size,
+                         TRUE);
+    if (!e && ino < 4)
+        e = nt_tx_bytes(rd64(v->super + 56) * v->block + (UINT64)ino * v->record_size, packed,
+                        v->record_size, TRUE);
+    return e;
+}
+static int nt_attr_replace(native_volume *v, UINT8 *raw, UINT8 *old, UINT32 oldlen,
+                           const UINT8 *replacement, UINT32 newlen)
+{
+    UINT32 at = (UINT32)(old - raw), used = rd32(raw + 24);
+    if (at < rd16(raw + 20) || at > used || oldlen > used - at || (newlen & 7) ||
+        newlen > v->record_size - (used - oldlen))
+        return K_ENOSPC;
+    memmove(raw + at + newlen, raw + at + oldlen, used - at - oldlen);
+    mem_copy(raw + at, replacement, newlen);
+    wr32(raw + 24, used - oldlen + newlen);
+    return 0;
+}
+static UINT32 nt_resident_attr(UINT8 *out, UINT32 type, UINT16 instance, const char *name,
+                               const void *value, UINT32 size)
+{
+    UINT32 chars = (UINT32)str_len(name), off = (24 + chars * 2 + 7) & ~7u,
+           len = (off + size + 7) & ~7u;
+    mem_zero(out, len);
+    wr32(out, type);
+    wr32(out + 4, len);
+    out[9] = (UINT8)chars;
+    wr16(out + 10, chars ? 24 : 0);
+    wr16(out + 14, instance);
+    wr32(out + 16, size);
+    wr16(out + 20, (UINT16)off);
+    for (UINT32 i = 0; i < chars; ++i)
+        wr16(out + 24 + i * 2, (UINT8)name[i]);
+    if (size)
+        mem_copy(out + off, value, size);
+    return len;
+}
+static int nt_record_append(native_volume *v, UINT8 *raw, const UINT8 *attribute, UINT32 n)
+{
+    UINT32 used = rd32(raw + 24);
+    if (used < 4 || used > v->record_size || n > v->record_size - used)
+        return K_ENOSPC;
+
+    if (used < 8 || rd32(raw + used - 8) != 0xffffffff)
+        return K_EIO;
+    mem_copy(raw + used - 8, attribute, n);
+    mem_zero(raw + used - 8 + n, 8);
+    wr32(raw + used - 8 + n, 0xffffffff);
+    wr32(raw + 24, used + n);
+    return 0;
+}
+static int nt_bitmap_bit(UINT32 ino, UINT32 type, UINT64 bit, BOOLEAN value, BOOLEAN change)
+{
+    native_volume *v = nt_tx_volume;
+    UINT8 raw[4096], *a, *p;
+    UINT32 len, size;
+    int e = ntfs_record(v, ino, raw);
+    if (e)
+        return e;
+    e = ntfs_attr(v, raw, type, "", &a, &len);
+    if (e)
+        return e;
+    UINT8 byte;
+    if (a[8]) {
+        native_run runs[NATIVE_RUNS];
+        UINT32 count;
+        e = ntfs_runs(v, a, len, runs, &count);
+        if (e)
+            return e;
+        if (bit / 8 >= rd64(a + 48))
+            return K_EIO;
+        e = nt_tx_stream(runs, count, bit / 8, &byte, 1, FALSE);
+        if (e)
+            return e;
+        if (!change)
+            return (byte & (1u << (bit % 8))) ? 1 : 0;
+        if (((byte & (1u << (bit % 8))) != 0) == value)
+            return K_EIO;
+        if (value)
+            byte |= (UINT8)(1u << (bit % 8));
+        else
+            byte &= (UINT8) ~(1u << (bit % 8));
+        return nt_tx_stream(runs, count, bit / 8, &byte, 1, TRUE);
+    }
+    e = ntfs_value(a, len, &p, &size);
+    if (e)
+        return e;
+    if (bit / 8 >= size)
+        return K_EIO;
+    /* Resident MFT bitmap edits may share sectors with other FILE records; stage from the latest sector image. */
+    e = nt_tx_stream(v->mft, v->mft_runs, (UINT64)ino * v->record_size, raw, v->record_size, FALSE);
+    if (e)
+        return e;
+    e = ntfs_fixup(v, raw, v->record_size, "FILE");
+    if (e)
+        return e;
+    e = ntfs_attr(v, raw, type, "", &a, &len);
+    if (e)
+        return e;
+    e = ntfs_value(a, len, &p, &size);
+    if (e)
+        return e;
+    byte = p[bit / 8];
+    if (!change)
+        return (byte & (1u << (bit % 8))) ? 1 : 0;
+    if (((byte & (1u << (bit % 8))) != 0) == value)
+        return K_EIO;
+    if (value)
+        p[bit / 8] |= (UINT8)(1u << (bit % 8));
+    else
+        p[bit / 8] &= (UINT8) ~(1u << (bit % 8));
+    return nt_tx_record(ino, raw);
+}
+static int nt_alloc_data(UINT64 size, native_run *run)
+{
+    native_volume *v = nt_tx_volume;
+    UINT64 want = (size + v->block - 1) / v->block;
+    if (!want) {
+        *run = (native_run){0};
+        return 0;
+    }
+    UINT8 bitmap[4096];
+    UINT64 total, available = 0, first = 0;
+    int e = ntfs_data(v, 6, 0, NULL, 0, &total, FALSE);
+    if (e)
+        return e;
+    if (total > 64ULL * 1024 * 1024 || total < (v->blocks + 7) / 8)
+        return K_ENOTSUP;
+    for (UINT64 off = 0; off < total; off += sizeof(bitmap)) {
+        UINT64 n = MIN(total - off, sizeof(bitmap)), got;
+        e = ntfs_data(v, 6, off, bitmap, n, &got, FALSE);
+        if (e)
+            return e;
+        for (UINT64 bit = 0; bit < n * 8; ++bit) {
+            UINT64 c = off * 8 + bit;
+            if (!c || c >= v->blocks - 1)
+                continue;
+            if (!(bitmap[bit / 8] & (1u << (bit % 8)))) {
+                if (!available)
+                    first = c;
+                ++available;
+                if (available == want) {
+                    *run = (native_run){0, first, want, FALSE};
+                    for (UINT64 j = 0; j < want; ++j) {
+                        e = nt_bitmap_bit(6, 0x80, first + j, TRUE, TRUE);
+                        if (e)
+                            return e;
+                    }
+                    return 0;
+                }
+            } else
+                available = 0;
+        }
+    }
+    return K_ENOSPC;
+}
+static UINT32 nt_data_attribute(UINT8 out[128], UINT16 id, const native_run *run, UINT64 size)
+{
+    if (!size)
+        return nt_resident_attr(out, 0x80, id, "", NULL, 0);
+    UINT64 len = run->length, lcn = run->physical;
+    UINT32 lb = 1, ob = 1;
+    while (lb < 8 && (len >> (lb * 8)))
+        ++lb;
+    while (ob < 8 && (lcn >> (ob * 8 - 1)))
+        ++ob;
+    UINT32 bytes = (64 + 1 + lb + ob + 1 + 7) & ~7u;
+    mem_zero(out, 128);
+    wr32(out, 0x80);
+    wr32(out + 4, bytes);
+    out[8] = 1;
+    wr16(out + 14, id);
+    wr64(out + 24, len - 1);
+    wr16(out + 32, 64);
+    wr64(out + 40, len * nt_tx_volume->block);
+    wr64(out + 48, size);
+    wr64(out + 56, size);
+    out[64] = (UINT8)(lb | (ob << 4));
+    for (UINT32 i = 0; i < lb; ++i)
+        out[65 + i] = (UINT8)(len >> (8 * i));
+    for (UINT32 i = 0; i < ob; ++i)
+        out[65 + lb + i] = (UINT8)(lcn >> (8 * i));
+    return bytes;
+}
+static int nt_name_compare(const char *a, const char *b)
+{
+    while (*a && *b) {
+        UINT8 x = (UINT8)*a++, y = (UINT8)*b++;
+        if (x >= 'a' && x <= 'z')
+            x -= 32;
+        if (y >= 'a' && y <= 'z')
+            y -= 32;
+        if (x != y)
+            return x < y ? -1 : 1;
+    }
+    return *a ? 1 : *b ? -1 : 0;
+}
+static int nt_index_change(native_volume *v, UINT32 parent, UINT64 reference, const UINT8 *filename,
+                           UINT32 keylen, BOOLEAN create)
+{
+    char name[256];
+    int e = ntfs_name(filename, keylen, name);
+    if (e)
+        return e;
+    UINT8 raw[4096], *attr, *value;
+    UINT32 len, size;
+    e = ntfs_record(v, parent, raw);
+    if (e)
+        return e;
+    if (!(rd16(raw + 22) & 2))
+        return K_EINVAL;
+    e = ntfs_attr(v, raw, 0x90, "$I30", &attr, &len);
+    if (e)
+        return e;
+    e = ntfs_value(attr, len, &value, &size);
+    if (e)
+        return e;
+    if (size < 32 || rd32(value + 4) != 1)
+        return K_ENOTSUP;
+    native_run runs[NATIVE_RUNS];
+    UINT32 count = 0;
+    UINT8 *ia;
+    UINT32 ialen;
+    int alloc_e = ntfs_attr(v, raw, 0xa0, "$I30", &ia, &ialen);
+    if (!alloc_e) {
+        e = ntfs_runs(v, ia, ialen, runs, &count);
+        if (e)
+            return e;
+    } else if (alloc_e != K_ENOENT)
+        return alloc_e;
+    UINT8 block[4096];
+    UINT8 *header = value + 16;
+    UINT32 cap = size - 16;
+    BOOLEAN root = TRUE;
+    UINT64 block_offset = 0;
+    for (UINT32 depth = 0; depth < 16; ++depth) {
+        if (cap < 16)
+            return K_EIO;
+        UINT32 at = rd32(header), used = rd32(header + 4), allocated = rd32(header + 8);
+        if (at < 16 || used < at || used > allocated || allocated > cap)
+            return K_EIO;
+        BOOLEAN descended = FALSE;
+        while (at + 16 <= used) {
+            UINT8 *entry = header + at;
+            UINT32 n = rd16(entry + 8), k = rd16(entry + 10), flags = rd16(entry + 12);
+            if (n < 16 + ((flags & 1) ? 8u : 0u) || (n & 7) || n > used - at ||
+                k > n - 16 - ((flags & 1) ? 8u : 0u) || (flags & ~3))
+                return K_EIO;
+            char existing[256];
+            int cmp = -1;
+            if (!(flags & 2)) {
+                e = ntfs_name(entry + 16, k, existing);
+                if (e)
+                    return K_ENOTSUP;
+                cmp = nt_name_compare(name, existing);
+            }
+            if (!(flags & 2) && cmp == 0) {
+                if (create)
+                    return K_EEXIST;
+                if (rd64(entry) != reference || k != keylen)
+                    return K_EIO;
+                mem_copy(entry + 16, filename, keylen);
+                goto store_index;
+            }
+            if ((flags & 2) || cmp < 0) {
+                if (flags & 1) {
+                    if (!count)
+                        return K_EIO;
+                    UINT64 vcn = rd64(entry + n - 8),
+                           unit = v->block <= v->index_size ? v->block : 512;
+                    if (vcn > ~0ULL / unit)
+                        return K_EIO;
+                    block_offset = vcn * unit;
+                    if (block_offset % v->index_size || block_offset > rd64(ia + 48) ||
+                        v->index_size > rd64(ia + 48) - block_offset)
+                        return K_EIO;
+                    UINT8 *ba, *bp;
+                    UINT32 bl, bs;
+                    UINT64 bitmap_bit = block_offset / v->index_size;
+                    UINT8 allocated_bit;
+                    e = ntfs_attr(v, raw, 0xb0, "$I30", &ba, &bl);
+                    if (e)
+                        return e;
+                    if (!ba[8]) {
+                        e = ntfs_value(ba, bl, &bp, &bs);
+                        if (e)
+                            return e;
+                        if (bitmap_bit / 8 >= bs)
+                            return K_EIO;
+                        allocated_bit = bp[bitmap_bit / 8];
+                    } else {
+                        native_run bm[NATIVE_RUNS];
+                        UINT32 bc;
+                        e = ntfs_runs(v, ba, bl, bm, &bc);
+                        if (e)
+                            return e;
+                        if (bitmap_bit / 8 >= rd64(ba + 48))
+                            return K_EIO;
+                        e = run_io(v, bm, bc, bitmap_bit / 8, &allocated_bit, 1, FALSE);
+                        if (e)
+                            return e;
+                    }
+                    if (!(allocated_bit & (1u << (bitmap_bit % 8))))
+                        return K_EIO;
+                    e = run_io(v, runs, count, block_offset, block, v->index_size, FALSE);
+                    if (e)
+                        return e;
+                    e = ntfs_fixup(v, block, v->index_size, "INDX");
+                    if (e)
+                        return e;
+                    if (rd64(block + 16) != vcn)
+                        return K_EIO;
+                    header = block + 24;
+                    cap = v->index_size - 24;
+                    root = FALSE;
+                    descended = TRUE;
+                    break;
+                }
+                if (!create)
+                    return K_ENOENT;
+                if (header[12])
+                    return K_ENOTSUP;
+                UINT32 need = (16 + keylen + 7) & ~7u;
+                if (root) { /* Only resident leaf indexes grow; no B-tree split approximation. */
+                    UINT8 replacement[4096];
+                    UINT32 oldvalue = (UINT32)(value - attr),
+                           newlen = (oldvalue + size + need + 7) & ~7u;
+                    if (newlen > sizeof(replacement) ||
+                        rd32(raw + 24) - len + newlen > v->record_size)
+                        return K_ENOSPC;
+                    mem_zero(replacement, newlen);
+                    mem_copy(replacement, attr, oldvalue + size);
+                    wr32(replacement + 4, newlen);
+                    wr32(replacement + 16, size + need);
+                    UINT8 *h = replacement + oldvalue + 16;
+                    memmove(h + at + need, h + at, used - at);
+                    mem_zero(h + at, need);
+                    wr64(h + at, reference);
+                    wr16(h + at + 8, (UINT16)need);
+                    wr16(h + at + 10, (UINT16)keylen);
+                    mem_copy(h + at + 16, filename, keylen);
+                    wr32(h + 4, used + need);
+                    wr32(h + 8, allocated + need);
+                    e = nt_attr_replace(v, raw, attr, len, replacement, newlen);
+                    if (e)
+                        return e;
+                    return nt_tx_record(parent, raw);
+                }
+                if (need > allocated - used)
+                    return K_ENOSPC;
+                memmove(header + at + need, header + at, used - at);
+                mem_zero(header + at, need);
+                wr64(header + at, reference);
+                wr16(header + at + 8, (UINT16)need);
+                wr16(header + at + 10, (UINT16)keylen);
+                mem_copy(header + at + 16, filename, keylen);
+                wr32(header + 4, used + need);
+                goto store_index;
+            }
+            at += n;
+        }
+        if (!descended)
+            return K_EIO;
+        continue;
+    store_index:
+        if (root)
+            return nt_tx_record(parent, raw);
+        {
+            UINT32 usa = rd16(block + 4), usac = rd16(block + 6);
+            if (usa < 40 || usa + usac * 2 > v->index_size)
+                return K_EIO;
+            UINT16 seq = (UINT16)(rd16(block + usa) + 1);
+            if (!seq || seq == 0xffff)
+                seq = 1;
+            wr16(block + usa, seq);
+            for (UINT32 i = 1; i < usac; ++i) {
+                wr16(block + usa + i * 2, rd16(block + i * 512 - 2));
+                wr16(block + i * 512 - 2, seq);
+            }
+            return nt_tx_stream(runs, count, block_offset, block, v->index_size, TRUE);
+        }
+    }
+    return K_E2BIG;
+}
+static int nt_prepare(native_volume *v)
+{
+    int e = native_clean(v);
+    if (e)
+        return e;
+    if (v->block > v->index_size || !rd64(v->super + 56) || rd64(v->super + 56) >= v->blocks)
+        return K_ENOTSUP;
+    UINT8 mirror_record[4096], *attribute;
+    UINT32 attrlen;
+    e = ntfs_record(v, 1, mirror_record);
+    if (e)
+        return e;
+    e = ntfs_attr(v, mirror_record, 0x80, "", &attribute, &attrlen);
+    if (e)
+        return e;
+    native_run mirror_runs[NATIVE_RUNS];
+    UINT32 mirror_count;
+    e = ntfs_runs(v, attribute, attrlen, mirror_runs, &mirror_count);
+    if (e)
+        return e;
+    if (mirror_count != 1 || mirror_runs[0].hole || mirror_runs[0].logical ||
+        mirror_runs[0].physical != rd64(v->super + 56) ||
+        mirror_runs[0].length * v->block < v->record_size * 4ULL)
+        return K_EIO;
+    nt_tx_volume = v;
+    nt_tx_count = 0;
+    return 0;
+}
+static int nt_commit(native_volume *v, const native_run *fresh, const void *data, UINT64 size)
+{
+    /* Stage the dirty volume record with other MFT edits to preserve 4Kn sector sharing. */
+    UINT8 vol[4096], *a, *p;
+    UINT32 len, n;
+    int e = ntfs_record(v, 3, vol);
+    if (e)
+        return e;
+    e = ntfs_attr(v, vol, 0x70, "", &a, &len);
+    if (e)
+        return e;
+    e = ntfs_value(a, len, &p, &n);
+    if (e)
+        return e;
+    if (n < 12 || rd16(p + 10))
+        return K_EROFS;
+    wr16(p + 10, 1);
+    e = nt_tx_record(3, vol);
+    if (e)
+        return e;
+    e = ntfs_dirty(v, TRUE);
+    if (e) {
+        v->failed = TRUE;
+        return e;
+    }
+    UINT8 sector[4096];
+    UINT64 off = 0, allocated = fresh->length * v->block;
+    while (!e && off < allocated) {
+        UINT64 nbytes = MIN(allocated - off, v->sector);
+        mem_zero(sector, v->sector);
+        UINT64 used = off < size ? MIN(size - off, nbytes) : 0;
+        if (used)
+            mem_copy(sector, (const UINT8 *)data + off, used);
+        e = native_write_bytes(v, fresh->physical * v->block + off, sector, nbytes);
+        off += nbytes;
+    }
+    for (UINT32 i = 0; !e && i < nt_tx_count; ++i)
+        e = native_write_bytes(v, nt_tx[i].lba * v->sector, nt_tx[i].bytes, v->sector);
+    if (!e)
+        e = ntfs_dirty(v, FALSE);
+    if (e)
+        v->failed = TRUE;
+    return e;
+}
+static int nt_new_record(native_volume *v, UINT32 *ino, UINT8 raw[4096])
+{
+    /* Use only initialized MFT slots; MFT expansion is unsupported. */
+    for (UINT32 i = 24; i < v->mft_count && i < 1048576; ++i) {
+        int e = nt_bitmap_bit(0, 0xb0, i, FALSE, FALSE);
+        if (e < 0)
+            return e;
+        if (e)
+            continue;
+        e = run_io(v, v->mft, v->mft_runs, (UINT64)i * v->record_size, raw, v->record_size, FALSE);
+        if (e)
+            return e;
+        UINT16 sequence = 1;
+        if (!memcmp(raw, "FILE", 4)) {
+            e = ntfs_fixup(v, raw, v->record_size, "FILE");
+            if (e)
+                return e;
+            if (rd16(raw + 22) & 1)
+                return K_EIO;
+            sequence = (UINT16)(rd16(raw + 16) + 1);
+            if (!sequence)
+                sequence = 1;
+        } else {
+            for (UINT32 j = 0; j < v->record_size; ++j)
+                if (raw[j])
+                    return K_EIO;
+        }
+        mem_zero(raw, v->record_size);
+        mem_copy(raw, "FILE", 4);
+        wr16(raw + 4, 48);
+        wr16(raw + 6, (UINT16)(v->record_size / 512 + 1));
+        wr16(raw + 16, sequence);
+        wr16(raw + 18, 1);
+        UINT32 attrs = (48 + 2 * (v->record_size / 512 + 1) + 7) & ~7u;
+        wr16(raw + 20, (UINT16)attrs);
+        wr16(raw + 22, 1);
+        wr32(raw + 24, attrs + 8);
+        wr32(raw + 28, v->record_size);
+        wr32(raw + 44, i);
+        wr32(raw + attrs, 0xffffffff);
+        e = nt_bitmap_bit(0, 0xb0, i, TRUE, TRUE);
+        if (e)
+            return e;
+        *ino = i;
+        return 0;
+    }
+    return K_ENOSPC;
+}
+static int ntfs_replace(k_file *f, const void *data, UINT64 size)
+{
+    native_volume *v = &native_volumes[f->object];
+    if (size > 4 * 1024 * 1024)
+        return K_E2BIG;
+    int e = nt_prepare(v);
+    if (e)
+        return e;
+    UINT8 raw[4096], *a, *fn;
+    UINT32 len, fnsize;
+    e = ntfs_record(v, f->cluster, raw);
+    if (e)
+        return e;
+    if (rd16(raw + 16) != f->directory_offset)
+        return K_ENOENT;
+    e = ntfs_regular_writable(v, f->cluster, raw);
+    if (e)
+        return e;
+    e = ntfs_attr(v, raw, 0x30, "", &a, &len);
+    if (e)
+        return e;
+    e = ntfs_value(a, len, &fn, &fnsize);
+    if (e)
+        return e;
+    char name[256];
+    e = ntfs_name(fn, fnsize, name);
+    if (e)
+        return e;
+    UINT64 parentref = rd64(fn);
+    UINT32 parent = (UINT32)(parentref & 0xffffffffffffULL);
+    if ((parentref & 0xffffffffffffULL) > 0xffffffff)
+        return K_ENOTSUP;
+    UINT8 parentraw[4096];
+    e = ntfs_record(v, parent, parentraw);
+    if (e)
+        return e;
+    if (rd16(parentraw + 16) != (parentref >> 48))
+        return K_EIO;
+    e = ntfs_attr(v, raw, 0x80, "", &a, &len);
+    if (e)
+        return e;
+    native_run old[NATIVE_RUNS];
+    UINT32 oldn = 0;
+    if (a[8]) {
+        e = ntfs_runs(v, a, len, old, &oldn);
+        if (e)
+            return e;
+        e = ntfs_data_boundaries(v, old, oldn);
+        if (e)
+            return e;
+    }
+    native_run fresh;
+    e = nt_alloc_data(size, &fresh);
+    if (e)
+        return e;
+    if (fresh.length) {
+        e = ntfs_metadata_boundaries(v, &fresh, 1);
+        if (e)
+            return e;
+    }
+    for (UINT32 i = 0; i < oldn; ++i) {
+        if (old[i].hole)
+            return K_ENOTSUP;
+        if (fresh.length && overlap(old[i].physical, old[i].length, fresh.physical, fresh.length))
+            return K_EIO;
+        for (UINT64 j = 0; j < old[i].length; ++j) {
+            e = nt_bitmap_bit(6, 0x80, old[i].physical + j, FALSE, TRUE);
+            if (e)
+                return e;
+        }
+    }
+    UINT8 replacement[128];
+    UINT32 newlen = nt_data_attribute(replacement, rd16(a + 14), &fresh, size);
+    e = nt_attr_replace(v, raw, a, len, replacement, newlen);
+    if (e)
+        return e;
+    e = ntfs_attr(v, raw, 0x30, "", &a, &len);
+    if (e)
+        return e;
+    e = ntfs_value(a, len, &fn, &fnsize);
+    if (e)
+        return e;
+    wr64(fn + 40, fresh.length * v->block);
+    wr64(fn + 48, size);
+    e = nt_index_change(v, parent, (UINT64)f->cluster | ((UINT64)rd16(raw + 16) << 48), fn, fnsize,
+                        FALSE);
+    if (e)
+        return e;
+    e = nt_tx_record(f->cluster, raw);
+    if (e)
+        return e;
+    e = nt_commit(v, &fresh, data, size);
+    if (!e)
+        f->size = size;
+    return e;
+}
+static int ntfs_create(UINT32 index, const char *path, BOOLEAN directory, const void *data,
+                       UINT64 size, k_file *out)
+{
+    native_volume *v = &native_volumes[index];
+    if (size > 4 * 1024 * 1024)
+        return K_E2BIG;
+    char parent_path[K_PATH_MAX], name[256];
+    str_copy(parent_path, path, sizeof(parent_path));
+    UINTN split = str_len(parent_path);
+    while (split && parent_path[split - 1] != '/')
+        --split;
+    str_copy(name, parent_path + split, sizeof(name));
+    parent_path[split ? split - 1 : 0] = 0;
+    UINT32 chars = (UINT32)str_len(name);
+    if (!chars || chars > 255 || name[chars - 1] == ' ' || name[chars - 1] == '.')
+        return K_EINVAL;
+    for (UINT32 i = 0; i < chars; ++i)
+        if (name[i] == '\\' || name[i] == ':' || name[i] == '*' || name[i] == '?' ||
+            name[i] == '"' || name[i] == '<' || name[i] == '>' || name[i] == '|')
+            return K_EINVAL;
+    k_file parent, exists;
+    int e = native_open(index, parent_path, &parent);
+    if (e)
+        return e;
+    if (!(parent.attributes & 0x10))
+        return K_EINVAL;
+    e = ntfs_directory(v, parent.cluster, name, &exists, NULL, NULL);
+    if (!e)
+        return K_EEXIST;
+    if (e != K_ENOENT)
+        return e;
+    e = nt_prepare(v);
+    if (e)
+        return e;
+    UINT8 parentraw[4096], *a, *si;
+    UINT32 len, silen;
+    e = ntfs_record(v, parent.cluster, parentraw);
+    if (e)
+        return e;
+    e = ntfs_attr(v, parentraw, 0x10, "", &a, &len);
+    if (e)
+        return e;
+    e = ntfs_value(a, len, &si, &silen);
+    if (e)
+        return e;
+    if (silen < 72 || !rd32(si + 52))
+        return K_ENOTSUP;
+    UINT8 raw[4096];
+    UINT32 ino;
+    e = nt_new_record(v, &ino, raw);
+    if (e)
+        return e;
+    if (directory)
+        wr16(raw + 22, 3);
+    native_run fresh = {0};
+    if (!directory) {
+        e = nt_alloc_data(size, &fresh);
+        if (e)
+            return e;
+    }
+    if (fresh.length) {
+        e = ntfs_metadata_boundaries(v, &fresh, 1);
+        if (e)
+            return e;
+    }
+    UINT8 standard[72];
+    mem_copy(standard, si, 72);
+    wr32(standard + 32, directory ? 0x10000000 : 0x20);
+    wr32(standard + 48, 0);
+    wr64(standard + 56, 0);
+    wr64(standard + 64, 0);
+    UINT8 attr[1024];
+    UINT32 n = nt_resident_attr(attr, 0x10, 0, "", standard, 72);
+    e = nt_record_append(v, raw, attr, n);
+    if (e)
+        return e;
+    UINT8 filename[576];
+    mem_zero(filename, sizeof(filename));
+    wr64(filename, (UINT64)parent.cluster | ((UINT64)rd16(parentraw + 16) << 48));
+    mem_copy(filename + 8, standard, 32);
+    wr64(filename + 40, fresh.length * v->block);
+    wr64(filename + 48, size);
+    wr32(filename + 56, directory ? 0x10000000 : 0x20);
+    filename[64] = (UINT8)chars;
+    filename[65] = 1;
+    for (UINT32 i = 0; i < chars; ++i)
+        wr16(filename + 66 + i * 2, (UINT8)name[i]);
+    UINT32 fnsize = 66 + chars * 2;
+    n = nt_resident_attr(attr, 0x30, 1, "", filename, fnsize);
+    e = nt_record_append(v, raw, attr, n);
+    if (e)
+        return e;
+    if (directory) {
+        UINT8 root[48];
+        mem_zero(root, 48);
+        wr32(root, 0x30);
+        wr32(root + 4, 1);
+        wr32(root + 8, v->index_size);
+        root[12] =
+            (UINT8)(v->index_size >= v->block ? v->index_size / v->block : v->index_size / 512);
+        wr32(root + 16, 16);
+        wr32(root + 20, 32);
+        wr32(root + 24, 32);
+        wr16(root + 40, 16);
+        wr16(root + 44, 2);
+        n = nt_resident_attr(attr, 0x90, 2, "$I30", root, 48);
+    } else
+        n = nt_data_attribute(attr, 2, &fresh, size);
+    e = nt_record_append(v, raw, attr, n);
+    if (e)
+        return e;
+    wr16(raw + 40, 3);
+    e = nt_index_change(v, parent.cluster, (UINT64)ino | ((UINT64)rd16(raw + 16) << 48), filename,
+                        fnsize, TRUE);
+    if (e)
+        return e;
+    e = nt_tx_record(ino, raw);
+    if (e)
+        return e;
+    e = nt_commit(v, &fresh, data, size);
+    if (!e && out)
+        *out = (k_file){5, index, ino, directory ? 0x10 : 0, size, rd16(raw + 16)};
+    return e;
+}
+
+static int native_create(UINT32 index, const char *path, BOOLEAN directory, k_file *out)
+{
+    if (index >= native_count)
+        return K_EINVAL;
+    if (native_volumes[index].kind == 4)
+        return ext_create(index, path, directory, NULL, 0, out);
+    return ntfs_create(index, path, directory, NULL, 0, out);
+}
+static int native_store(UINT32 index, const char *path, const void *data, UINT64 size)
+{
+    if (index >= native_count)
+        return K_EINVAL;
+    k_file f;
+    int e = native_open(index, path, &f);
+    if (e == K_ENOENT)
+        return native_volumes[index].kind == 4 ? ext_create(index, path, FALSE, data, size, NULL)
+                                               : ntfs_create(index, path, FALSE, data, size, NULL);
+    if (e)
+        return e;
+    if (f.attributes & 0x10)
+        return K_EINVAL;
+    if (f.kind == 4)
+        return ext_replace(&f, data, size);
+    return ntfs_replace(&f, data, size);
+}
+
+static const char *native_description(UINT32 i)
+{
+    if (i >= native_count)
+        return "invalid volume";
+    native_volume *v = &native_volumes[i];
+    return v->kind == 4 ? (v->read_only || v->failed
+                               ? "ext4 read-only"
+                               : "ext4 read/write (bounded inline extents, non-indexed creation)")
+                        : (v->read_only || v->failed
+                               ? "NTFS read-only"
+                               : "NTFS read/write (existing MFT capacity, no index splits)");
+}
+static int native_sync_all(void)
+{
+    int e = 0;
+    for (UINT32 i = 0; i < native_count; ++i) {
+        int n = native_volumes[i].failed  ? K_EIO
+                : native_volumes[i].wrote ? disk_flush(native_volumes[i].disk)
+                                          : 0;
+        if (n && !e)
+            e = n;
+    }
+    return e;
+}
+
+/* GPT requires valid header and entry-array CRCs; corrupt GPT is not reinterpreted as MBR. */
 static UINT32 crc_step(UINT32 crc, const UINT8 *p, UINTN n)
 {
     while (n--) {
@@ -5563,10 +8302,7 @@ static int gpt_parse(UINT32 disk_id, UINT64 header_lba, partition_entry parts[12
     }
     return 0;
 }
-static BOOLEAN extended_type(UINT8 t)
-{
-    return t == 5 || t == 0x0f || t == 0x85;
-}
+static BOOLEAN extended_type(UINT8 t) { return t == 5 || t == 0x0f || t == 0x85; }
 static int mbr_parse(UINT32 id, const UINT8 mbr[512], partition_entry parts[128], UINT32 *count)
 {
     UINT64 disk_size = disks[id].info.sectors, ext_base = 0, ext_length = 0;
@@ -5640,7 +8376,7 @@ int k_vfs_mount_disks(void)
 {
     if (!vfs_ready || k_cpu_id() != 0 || mount_count)
         return K_EBUSY;
-    for (UINT32 id = 0; id < disk_count; ++id) {
+    for (UINT32 id = 0; id < k_disk_count(); ++id) {
         char path[K_PATH_MAX];
         str_copy(path, "/devices/", sizeof(path));
         str_copy(path + 9, disks[id].info.name, K_PATH_MAX - 9);
@@ -5682,13 +8418,33 @@ int k_vfs_mount_disks(void)
             e = mbr_parse(id, sector, parts, &count);
         if (!e && count) {
             for (UINT32 p = 0; p < count; ++p) {
-                UINT32 before = volume_count;
+                UINT32 part_index = partition_count;
+                if (partition_count < MAX_PARTITIONS) {
+                    partitions[partition_count] =
+                        (k_partition_info){partition_count,
+                                           id,
+                                           parts[p].number,
+                                           disks[id].info.sector_size,
+                                           parts[p].start,
+                                           parts[p].length,
+                                           recovered || parts[p].read_only,
+                                           0,
+                                           0,
+                                           0};
+                    ++partition_count;
+                }
+                UINT32 before = volume_count, prior_mount = mount_count;
                 if (!fat_mount(id, parts[p].start, parts[p].length, parts[p].number) &&
                     before < volume_count)
                     volumes[before].partition_ro = recovered || parts[p].read_only;
+                if (prior_mount == mount_count)
+                    (void)native_probe(id, parts[p].start, parts[p].length, parts[p].number,
+                                       recovered || parts[p].read_only);
+                if (part_index < partition_count)
+                    partitions[part_index].mounted = prior_mount < mount_count;
             }
         } else if (!protective) {
-            /* Superfloppy BPB still undergoes full FAT validation. */
+            /* Superfloppy BPBs still undergo full FAT validation. */
             UINT32 before = volume_count;
             if (!fat_mount(id, 0, disks[id].info.sectors, 0) && before < volume_count)
                 volumes[before].partition_ro = e != 0;
@@ -5706,11 +8462,15 @@ static BOOLEAN valid_process(k_process *p)
     UINTN a = (UINTN)p, b = (UINTN)processes;
     return a >= b && a < b + sizeof(processes) && !((a - b) % sizeof(*p)) && p->used;
 }
-k_process *k_process_create(const char *name)
+static k_process *process_create_locked(const char *name)
 {
-    if (k_cpu_id() != 0 || !name || !next_process_id)
+    if (!name)
         return NULL;
     UINT64 f = k_spin_lock(&sched_lock);
+    if (!next_process_id) {
+        k_spin_unlock(&sched_lock, f);
+        return NULL;
+    }
     k_process *p = NULL;
     for (UINT32 i = 0; i < MAX_PROCESSES; ++i)
         if (!processes[i].used) {
@@ -5718,6 +8478,10 @@ k_process *k_process_create(const char *name)
             mem_zero(p, sizeof(*p));
             p->used = TRUE;
             p->id = next_process_id++;
+            p->execution_class = K_EXEC_RING3;
+            /* Process UUIDs are instance identifiers, never secrets. */
+            wr64(p->uuid, rdtsc() ^ (UINT64)(UINTN)kernel_pml4 ^ saved_pat);
+            wr64(p->uuid + 8, ((UINT64)p->id << 32) | p->id);
             str_copy(p->name, name, sizeof(p->name));
             break;
         }
@@ -5726,20 +8490,24 @@ k_process *k_process_create(const char *name)
         return NULL;
     p->as = k_as_create();
     if (!p->as) {
+        f = k_spin_lock(&sched_lock);
         p->used = FALSE;
+        k_spin_unlock(&sched_lock, f);
         return NULL;
     }
     p->as->owner = p;
     return p;
 }
-k_address_space *k_process_space(k_process *p)
+k_process *k_process_create(const char *name)
 {
-    return valid_process(p) ? p->as : NULL;
+    if (k_mutex_lock(&process_mutex))
+        return NULL;
+    k_process *p = process_create_locked(name);
+    k_mutex_unlock(&process_mutex);
+    return p;
 }
-UINT32 k_process_id(k_process *p)
-{
-    return valid_process(p) ? p->id : 0;
-}
+k_address_space *k_process_space(k_process *p) { return valid_process(p) ? p->as : NULL; }
+UINT32 k_process_id(k_process *p) { return valid_process(p) ? p->id : 0; }
 static int rief_string(const UINT8 *bytes, const rief_header_t *h, UINT32 off, char out[128])
 {
     if (off >= h->string_table_size)
@@ -5760,8 +8528,7 @@ static BOOLEAN overlap(UINT64 a, UINT64 n, UINT64 b, UINT64 m)
 {
     return n && m && a < b + m && b < a + n;
 }
-/* Roll back only mappings made by this load, preserving previously allocated
- * user objects that an explicit import binding might refer to. */
+/* RIEF load rollback removes only mappings created by that load. */
 static BOOLEAN rollback_tree(UINT64 *table, UINT32 level, UINT64 base, UINT64 from)
 {
     BOOLEAN empty = TRUE;
@@ -5801,11 +8568,11 @@ static void as_rollback(k_address_space *as, UINT64 old_next, UINT32 old_pages)
     as->pages = old_pages;
     k_spin_unlock(&vm_lock, f);
 }
-int k_rief_load(k_process *p, const void *image, UINT64 size, const k_rief_binding *bindings,
-                UINT32 binding_count)
+static int rief_load_locked(k_process *p, const void *image, UINT64 size,
+                            const k_rief_binding *bindings, UINT32 binding_count)
 {
-    if (!valid_process(p) || p->loaded || p->task_id || !image || k_cpu_id() != 0 ||
-        (binding_count && !bindings) || binding_count > 64)
+    if (!valid_process(p) || p->loaded || p->task_id || !image || (binding_count && !bindings) ||
+        binding_count > 64)
         return K_EINVAL;
     if (size < sizeof(rief_header_t) || size > 64ULL * 1024 * 1024)
         return K_ENOEXEC;
@@ -5883,8 +8650,7 @@ int k_rief_load(k_process *p, const void *image, UINT64 size, const k_rief_bindi
         if (!found)
             return K_ENOENT;
     }
-    /* Relocations are sorted by (patch_region, patch_offset) and disjoint.
-     * This bounds validation work and prevents last-relocation-wins ambiguity. */
+    /* RIEF relocations are sorted and disjoint to avoid overlapping-patch ambiguity. */
     UINT32 last_region = 0;
     UINT64 last_end = 0;
     for (UINT32 i = 0; i < h.reloc_count; ++i) {
@@ -5938,6 +8704,7 @@ int k_rief_load(k_process *p, const void *image, UINT64 size, const k_rief_bindi
             target = imports[r.target_region];
         else
             target = p->region_base[r.target_region] + r.target_offset;
+
         if (r.addend >= 0) {
             if ((UINT64)r.addend > ~0ULL - target) {
                 error = K_ENOEXEC;
@@ -5997,6 +8764,16 @@ fail:
     mem_zero(p->exports, sizeof(p->exports));
     return error;
 }
+int k_rief_load(k_process *p, const void *image, UINT64 size, const k_rief_binding *bindings,
+                UINT32 binding_count)
+{
+    int e = k_mutex_lock(&process_mutex);
+    if (e)
+        return e;
+    e = rief_load_locked(p, image, size, bindings, binding_count);
+    k_mutex_unlock(&process_mutex);
+    return e;
+}
 int k_rief_export(k_process *p, const char *symbol, UINT64 *address)
 {
     if (!valid_process(p) || !p->loaded || !symbol || !address)
@@ -6008,9 +8785,9 @@ int k_rief_export(k_process *p, const char *symbol, UINT64 *address)
         }
     return K_ENOENT;
 }
-int k_process_start(k_process *p, UINT32 *id)
+static int process_start_locked(k_process *p, UINT32 cpu, UINT32 *id)
 {
-    if (!valid_process(p) || !p->loaded || p->task_id || !id || k_cpu_id() != 0)
+    if (!valid_process(p) || !p->loaded || p->task_id || !id)
         return K_EINVAL;
     if (!p->user_stack) {
         UINT64 stack;
@@ -6019,13 +8796,45 @@ int k_process_start(k_process *p, UINT32 *id)
             return e;
         p->user_stack = stack + 8 * 4096 - 40;
     }
+    if (!p->tls) {
+        int e = k_as_alloc(p->as, K_TLS_BYTES, 4096, RIEF_REGION_R | RIEF_REGION_W, &p->tls);
+        if (e)
+            return e;
+        UINT64 tcb[3] = {p->tls, p->id, 0};
+        e = k_copy_to_user(p->as, p->tls, tcb, sizeof(tcb));
+        if (e)
+            return e;
+    }
     UINT64 f = k_spin_lock(&sched_lock);
-    task *t = new_task(p->name, NULL, NULL, 1024, 0, FALSE);
+    if (cpu == K_CPU_AUTO) {
+        UINT64 least = ~0ULL;
+        cpu = 0;
+        for (UINT32 c = 0; c < platform.discovered_cpus; ++c)
+            if (cpus[c].online) {
+                UINT64 load = 0;
+                for (UINT32 i = 0; i < K_MAX_TASKS; ++i)
+                    if (tasks[i].cpu == c && !tasks[i].idle && tasks[i].state != K_TASK_UNUSED &&
+                        tasks[i].state != K_TASK_ZOMBIE)
+                        load += tasks[i].weight;
+                if (load < least) {
+                    least = load;
+                    cpu = c;
+                }
+            }
+    }
+    if (cpu >= platform.discovered_cpus || !cpus[cpu].online) {
+        k_spin_unlock(&sched_lock, f);
+        return K_EINVAL;
+    }
+    task *t = new_task(p->name, NULL, NULL, 1024, cpu, FALSE);
     if (!t) {
         k_spin_unlock(&sched_lock, f);
         return K_ENOMEM;
     }
     t->process = p;
+    t->fs_base = p->tls;
+    UINT64 tid = t->id;
+    (void)k_copy_to_user(p->as, p->tls + 16, &tid, sizeof(tid));
     t->frame->rip = p->entry;
     t->frame->cs = 0x23;
     t->frame->ss = 0x1b;
@@ -6037,9 +8846,19 @@ int k_process_start(k_process *p, UINT32 *id)
     k_spin_unlock(&sched_lock, f);
     return 0;
 }
-int k_process_destroy(k_process *p)
+int k_process_start_on(k_process *p, UINT32 cpu, UINT32 *id)
 {
-    if (!valid_process(p) || k_cpu_id() != 0)
+    int e = k_mutex_lock(&process_mutex);
+    if (e)
+        return e;
+    e = process_start_locked(p, cpu, id);
+    k_mutex_unlock(&process_mutex);
+    return e;
+}
+int k_process_start(k_process *p, UINT32 *id) { return k_process_start_on(p, K_CPU_AUTO, id); }
+static int process_destroy_locked(k_process *p)
+{
+    if (!valid_process(p))
         return K_EINVAL;
     UINT64 f = k_spin_lock(&sched_lock);
     if (p->task_id) {
@@ -6058,6 +8877,7 @@ int k_process_destroy(k_process *p)
                 free_task(&tasks[i]);
             }
     }
+    process_resources_release(p);
     p->as->owner = NULL;
     k_spin_unlock(&sched_lock, f);
     int e = k_as_destroy(p->as);
@@ -6065,8 +8885,19 @@ int k_process_destroy(k_process *p)
         p->as->owner = p;
         return e;
     }
+    f = k_spin_lock(&sched_lock);
     mem_zero(p, sizeof(*p));
+    k_spin_unlock(&sched_lock, f);
     return 0;
+}
+int k_process_destroy(k_process *p)
+{
+    int e = k_mutex_lock(&process_mutex);
+    if (e)
+        return e;
+    e = process_destroy_locked(p);
+    k_mutex_unlock(&process_mutex);
+    return e;
 }
 int k_process_get(UINT32 i, k_process_info *out)
 {
@@ -6078,8 +8909,22 @@ int k_process_get(UINT32 i, k_process_info *out)
         k_spin_unlock(&sched_lock, f);
         return K_ENOENT;
     }
-    *out = (k_process_info){p->id,        p->task_id,       p->state,    p->fault_vector,
-                            p->exit_code, p->fault_address, p->fault_ip, {0}};
+    mem_zero(out, sizeof(*out));
+    out->id = p->id;
+    out->task_id = p->task_id;
+    out->state = p->state;
+    out->fault_vector = p->fault_vector;
+    out->exit_code = p->exit_code;
+    out->fault_address = p->fault_address;
+    out->fault_ip = p->fault_ip;
+    out->parent = p->parent;
+    out->execution_class = p->execution_class;
+    mem_copy(out->uuid, p->uuid, 16);
+    for (UINT32 j = 0; j < K_MAX_TASKS; ++j)
+        if (tasks[j].process == p) {
+            out->cpu = tasks[j].cpu;
+            break;
+        }
     str_copy(out->name, p->name, sizeof(out->name));
     k_spin_unlock(&sched_lock, f);
     return 0;
@@ -6087,7 +8932,8 @@ int k_process_get(UINT32 i, k_process_info *out)
 static int user_string(k_process *p, UINT64 address, char out[K_PATH_MAX])
 {
     for (UINT32 i = 0; i < K_PATH_MAX; ++i) {
-        if (address > K_USER_LIMIT - 1 - i || k_copy_from_user(p->as, &out[i], address + i, 1))
+        if (address > K_USER_CANON_LIMIT - 1 - i ||
+            k_copy_from_user(p->as, &out[i], address + i, 1))
             return K_EFAULT;
         if (!out[i])
             return i ? 0 : K_EINVAL;
@@ -6141,7 +8987,7 @@ static INT64 syscall_dispatch(irq_frame *f)
             if (e)
                 return e;
             for (UINT64 i = 0; i < n; ++i) {
-                /* Keep user output from interpreting terminal control bytes. */
+                /* Sanitize user console output; do not interpret terminal control bytes. */
                 char c = buf[i];
                 con_putc((c == '\n' || (c >= 32 && c < 127)) ? c : '?');
             }
@@ -6201,8 +9047,8 @@ static INT64 syscall_dispatch(irq_frame *f)
             return e;
         if (p->files[fd].attributes & 0x10)
             return K_EINVAL;
-        /* Raw block-device nodes are privileged; applications use files. */
-        if (p->files[fd].kind == 3)
+        /* Raw block devices are privileged; ordinary applications use files. */
+        if (p->files[fd].kind == 3 && p->execution_class != K_EXEC_RING1)
             return K_EPERM;
         if (flags & K_OPEN_TRUNC) {
             e = k_vfs_put(path, NULL, 0);
@@ -6251,21 +9097,749 @@ static INT64 syscall_dispatch(irq_frame *f)
         p->fd_used[f->rdi] = FALSE;
         return 0;
     default:
+        return syscall_extended(p, t, f);
+    }
+}
+
+#define MAX_SERVICES 32
+static struct {
+    char name[64];
+    UINT32 pid, task;
+} services[MAX_SERVICES];
+static k_process *process_by_pid(UINT32 pid)
+{
+    for (UINT32 i = 0; i < MAX_PROCESSES; ++i)
+        if (processes[i].used && processes[i].id == pid)
+            return &processes[i];
+    return NULL;
+}
+static task *process_task(k_process *p)
+{
+    for (UINT32 i = 0; i < K_MAX_TASKS; ++i)
+        if (tasks[i].state != K_TASK_UNUSED && tasks[i].process == p)
+            return &tasks[i];
+    return NULL;
+}
+static void process_resources_release(k_process *p)
+{
+    /* Resource leases cannot outlive the owning process instance. */
+    for (UINT32 i = 0; i < MAX_SERVICES; ++i)
+        if (services[i].pid == p->id)
+            mem_zero(&services[i], sizeof(services[i]));
+    for (UINT32 i = 0; i < partition_count; ++i)
+        if (partitions[i].owner_pid == p->id)
+            partitions[i].owner_pid = 0;
+    if (input_owner == p->id)
+        input_owner = 0;
+}
+static BOOLEAN process_return_control(task *t)
+{
+    UINT64 f = k_spin_lock(&sched_lock);
+    UINT32 request = t->control_request;
+    if (!request) {
+        k_spin_unlock(&sched_lock, f);
+        return FALSE;
+    }
+    t->control_request = 0;
+    if (request == K_CTL_KILL) {
+        t->exit_code = -143;
+        t->state = K_TASK_ZOMBIE;
+        t->process->exit_code = -143;
+        t->process->state = K_TASK_ZOMBIE;
+        process_resources_release(t->process);
+    } else if (request == K_CTL_STOP) {
+        t->state = K_TASK_STOPPED;
+        t->process->state = K_TASK_STOPPED;
+    }
+    t->preempt_depth = 0;
+    k_spin_unlock(&sched_lock, f);
+    return TRUE;
+}
+int k_process_query(UINT32 pid, k_process_info *out)
+{
+    if (!out)
+        return K_EINVAL;
+    for (UINT32 i = 0; i < MAX_PROCESSES; ++i) {
+        int e = k_process_get(i, out);
+        if (!e && out->id == pid)
+            return 0;
+    }
+    return K_ENOENT;
+}
+int k_process_identity(UINT32 pid, k_identity *out)
+{
+    if (!out)
+        return K_EINVAL;
+    UINT64 irq = k_spin_lock(&sched_lock);
+    k_process *p = process_by_pid(pid);
+    if (!p) {
+        k_spin_unlock(&sched_lock, irq);
+        return K_ENOENT;
+    }
+    mem_zero(out, sizeof(*out));
+    mem_copy(out->uuid, p->uuid, 16);
+    out->pid = p->id;
+    out->parent = p->parent;
+    out->execution_class = p->execution_class;
+    out->tls = p->tls;
+    task *t = process_task(p);
+    out->cpu = t ? t->cpu : K_CPU_AUTO;
+    k_spin_unlock(&sched_lock, irq);
+    return 0;
+}
+static int process_control_locked(UINT32 pid, UINT32 op)
+{
+    if (op < K_CTL_KILL || op > K_CTL_CONTINUE)
+        return K_EINVAL;
+    UINT64 irq = k_spin_lock(&sched_lock);
+    k_process *p = process_by_pid(pid);
+    task *t = p ? process_task(p) : NULL;
+    if (!t || t->state == K_TASK_ZOMBIE) {
+        k_spin_unlock(&sched_lock, irq);
+        return K_ENOENT;
+    }
+    if (op == K_CTL_CONTINUE) {
+        if (t->control_request != K_CTL_KILL)
+            t->control_request = 0;
+        if (t->state == K_TASK_STOPPED) {
+            task_ready(t);
+            p->state = t->state;
+        }
+    } else {
+        if (op == K_CTL_KILL || t->control_request != K_CTL_KILL)
+            t->control_request = op;
+        /* Control requests do not abandon an in-progress blocked kernel mutex operation. */
+        if (t->state == K_TASK_STOPPED || t->state == K_TASK_SLEEPING) {
+            task_ready(t);
+            p->state = t->state;
+        }
+    }
+    __atomic_store_n(&cpus[t->cpu].work_pending, 1, __ATOMIC_RELEASE);
+    k_spin_unlock(&sched_lock, irq);
+    return 0;
+}
+int k_process_control(UINT32 pid, UINT32 op)
+{
+    int e = k_mutex_lock(&process_mutex);
+    if (e)
+        return e;
+    e = process_control_locked(pid, op);
+    k_mutex_unlock(&process_mutex);
+    return e;
+}
+int k_process_reap_pid(UINT32 pid, k_process_info *out)
+{
+    int e = k_mutex_lock(&process_mutex);
+    if (e)
+        return e;
+    k_process *p = process_by_pid(pid);
+    if (!p)
+        e = K_ENOENT;
+    else {
+        if (out)
+            e = k_process_query(pid, out);
+        if (!e)
+            e = process_destroy_locked(p);
+    }
+    k_mutex_unlock(&process_mutex);
+    return e;
+}
+int k_process_launch(const char *path, const char *arguments, UINT32 cls, UINT32 cpu, UINT32 parent,
+                     UINT32 *pid)
+{
+    if (!path || !arguments || !pid || (cls != K_EXEC_RING1 && cls != K_EXEC_RING3) ||
+        str_len(arguments) >= K_PROCESS_ARGS_MAX)
+        return K_EINVAL;
+    int e = k_mutex_lock(&process_mutex);
+    if (e)
+        return e;
+    task *caller = current_task();
+    k_process *actor = caller ? caller->process : NULL;
+    if (actor &&
+        (parent != actor->id || (cls == K_EXEC_RING1 && actor->execution_class != K_EXEC_RING1))) {
+        e = K_EPERM;
+        goto done;
+    }
+    k_file file;
+    e = k_vfs_open(path, &file);
+    if (e)
+        goto done;
+    if (file.kind == 3 || (file.attributes & 0x10) || file.size < sizeof(rief_header_t) ||
+        file.size > 4 * 1024 * 1024) {
+        e = K_ENOEXEC;
+        goto done;
+    }
+    UINT32 pages = (UINT32)((file.size + 4095) / 4096);
+    UINT64 image = k_pmm_alloc_pages(pages, 0), got = 0;
+    if (!image) {
+        e = K_ENOMEM;
+        goto done;
+    }
+    e = k_vfs_read(&file, 0, (void *)(UINTN)image, file.size, &got);
+    if (!e && got != file.size)
+        e = K_EIO;
+    k_process *p = NULL;
+    if (!e) {
+        p = process_create_locked(path);
+        if (!p)
+            e = K_ENOMEM;
+    }
+    if (!e) {
+        p->parent = parent;
+        p->execution_class = cls;
+        str_copy(p->arguments, arguments, sizeof(p->arguments));
+        e = rief_load_locked(p, (void *)(UINTN)image, file.size, NULL, 0);
+    }
+    k_pmm_free_pages(image, pages);
+    if (!e) {
+        UINT32 tid;
+        e = process_start_locked(p, cpu, &tid);
+        if (!e)
+            *pid = p->id;
+    }
+    if (e && p)
+        (void)process_destroy_locked(p);
+done:
+    k_mutex_unlock(&process_mutex);
+    return e;
+}
+static int service_name(const char *name)
+{
+    UINTN n = str_len(name);
+    if (!n || n >= 64)
+        return K_EINVAL;
+    for (UINTN i = 0; i < n; ++i)
+        if (!((name[i] >= 'a' && name[i] <= 'z') || (name[i] >= 'A' && name[i] <= 'Z') ||
+              (name[i] >= '0' && name[i] <= '9') || name[i] == '_' || name[i] == '-' ||
+              name[i] == '.'))
+            return K_EINVAL;
+    return 0;
+}
+static int grant_locked(k_process *p, UINT32 tid)
+{
+    for (UINT32 i = 0; i < p->grant_count; ++i)
+        if (p->grants[i] == tid)
+            return 0;
+    /* Prune dead service endpoints so restarts do not exhaust IPC grants. */
+    for (UINT32 i = 0; i < p->grant_count;) {
+        BOOLEAN live = FALSE;
+        for (UINT32 j = 0; j < K_MAX_TASKS; ++j)
+            if (tasks[j].id == p->grants[i] && tasks[j].state != K_TASK_UNUSED &&
+                tasks[j].state != K_TASK_ZOMBIE)
+                live = TRUE;
+        if (live)
+            ++i;
+        else
+            p->grants[i] = p->grants[--p->grant_count];
+    }
+    if (p->grant_count == ARRAY_LEN(p->grants))
+        return K_E2BIG;
+    p->grants[p->grant_count++] = tid;
+    return 0;
+}
+static int service_register(k_process *p, const char *name)
+{
+    if (p->execution_class != K_EXEC_RING1)
+        return K_EPERM;
+    int e = service_name(name);
+    if (e)
+        return e;
+    UINT64 irq = k_spin_lock(&sched_lock);
+    int slot = -1;
+    for (UINT32 i = 0; i < MAX_SERVICES; ++i) {
+        k_process *owner = process_by_pid(services[i].pid);
+        if (!owner || owner->state == K_TASK_ZOMBIE)
+            mem_zero(&services[i], sizeof(services[i]));
+        if (services[i].pid && str_eq(services[i].name, name)) {
+            e = services[i].pid == p->id ? 0 : K_EEXIST;
+            goto done;
+        }
+        if (!services[i].pid && slot < 0)
+            slot = (int)i;
+    }
+    if (slot < 0) {
+        e = K_E2BIG;
+        goto done;
+    }
+    str_copy(services[slot].name, name, 64);
+    services[slot].pid = p->id;
+    services[slot].task = p->task_id;
+done:
+    k_spin_unlock(&sched_lock, irq);
+    return e;
+}
+int k_service_lookup(const char *name, UINT32 *tid)
+{
+    if (!name || !tid)
+        return K_EINVAL;
+    int e = service_name(name);
+    if (e)
+        return e;
+    task *caller = current_task();
+    if (!caller)
+        return K_EPERM;
+    UINT64 irq = k_spin_lock(&sched_lock);
+    e = K_ENOENT;
+    for (UINT32 i = 0; i < MAX_SERVICES; ++i)
+        if (services[i].pid && str_eq(services[i].name, name)) {
+            k_process *p = process_by_pid(services[i].pid);
+            if (!p || p->state == K_TASK_ZOMBIE)
+                break;
+            /* Reciprocal service IPC grants are installed transactionally. */
+            BOOLEAN already = FALSE;
+            for (UINT32 j = 0; j < p->grant_count; ++j)
+                if (p->grants[j] == caller->id)
+                    already = TRUE;
+            e = grant_locked(p, caller->id);
+            if (!e && caller->process)
+                e = grant_locked(caller->process, services[i].task);
+            if (e) {
+                if (!already)
+                    for (UINT32 j = 0; j < p->grant_count; ++j)
+                        if (p->grants[j] == caller->id) {
+                            p->grants[j] = p->grants[--p->grant_count];
+                            break;
+                        }
+                break;
+            }
+            *tid = services[i].task;
+            break;
+        }
+    k_spin_unlock(&sched_lock, irq);
+    return e;
+}
+BOOLEAN k_input_claimed(void)
+{
+    UINT64 irq = k_spin_lock(&sched_lock);
+    k_process *p = process_by_pid(input_owner);
+    BOOLEAN claimed = p && p->state != K_TASK_ZOMBIE;
+    if (!claimed)
+        input_owner = 0;
+    k_spin_unlock(&sched_lock, irq);
+    return claimed;
+}
+int k_partition_get(UINT32 index, k_partition_info *out)
+{
+    if (!out || index >= partition_count)
+        return K_ENOENT;
+    UINT64 irq = k_spin_lock(&sched_lock);
+    *out = partitions[index];
+    k_spin_unlock(&sched_lock, irq);
+    return 0;
+}
+static int admin_map_at(k_process *p, UINT64 address, UINT64 bytes, UINT32 rwx)
+{
+    if (!bytes || bytes > MAX_USER_PAGES * 4096ULL || (address & 4095) || address < 0x10000 ||
+        address >= K_USER_CANON_LIMIT || bytes > K_USER_CANON_LIMIT - address ||
+        !(rwx & RIEF_REGION_R) || (rwx & ~7) || ((rwx & 6) == 6) || !platform.nx)
+        return K_EINVAL;
+    UINT64 count = (bytes + 4095) / 4096, slot = address >> 39;
+    if ((address + count * 4096 - 1) >> 39 != slot)
+        return K_EINVAL;
+    if (kernel_pml4[slot] & PAGE_PRESENT)
+        return K_EPERM;
+    k_address_space *as = p->as;
+    UINT64 irq = k_spin_lock(&vm_lock);
+    int e = 0;
+    if (count > MAX_USER_PAGES - as->pages) {
+        e = K_ENOMEM;
+        goto done;
+    }
+    for (UINT64 i = 0; i < count; ++i)
+        if (!vmm_translate(as->pml4, address + i * 4096, NULL, NULL)) {
+            e = K_EEXIST;
+            goto done;
+        }
+    as->private_slots[slot / 64] |= 1ULL << (slot % 64);
+    UINT64 flags = PAGE_USER | ((rwx & 2) ? PAGE_RW : 0) | ((rwx & 4) ? 0 : PAGE_NX), made = 0;
+    for (; made < count; ++made) {
+        UINT64 pa = pmm_alloc_page();
+        if (!pa) {
+            e = K_ENOMEM;
+            break;
+        }
+        e = map_page_raw(as->pml4, address + made * 4096, pa, flags, FALSE);
+        if (e) {
+            pmm_free_page(pa);
+            break;
+        }
+    }
+    if (e) {
+        for (UINT64 i = 0; i < made; ++i) {
+            UINT64 va = address + i * 4096, *t = as->pml4;
+            for (int level = 4; level > 1; --level)
+                t = (void *)(UINTN)(t[(va >> (12 + 9 * (level - 1))) & 511] & PHYS_MASK);
+            UINT32 idx = (va >> 12) & 511;
+            pmm_free_page(t[idx] & PHYS_MASK);
+            t[idx] = 0;
+        }
+    } else
+        as->pages += (UINT32)count;
+done:
+    k_spin_unlock(&vm_lock, irq);
+    return e;
+}
+static INT64 admin_operation(k_process *p, const k_admin_request *r)
+{
+    if (p->execution_class != K_EXEC_RING1 || memcmp(r->caller_uuid, p->uuid, 16))
+        return K_EPERM;
+    if (r->version != 1 || r->size != sizeof(*r) || r->flags)
+        return K_EINVAL;
+    if (r->operation >= K_ADMIN_MEM_READ && r->operation <= K_ADMIN_MAP_AT) {
+        int e = k_mutex_lock(&process_mutex);
+        if (e)
+            return e;
+        k_process *target = process_by_pid(r->target_pid);
+        if (!target || memcmp(target->uuid, r->target_uuid, 16)) {
+            e = K_ENOENT;
+            goto memory_done;
+        }
+        UINT64 irq = k_spin_lock(&sched_lock);
+        task *t = process_task(target);
+        BOOLEAN safe = (target == p || !t || t->state == K_TASK_STOPPED);
+        /* STOPPED may publish before the old CPU has left the target's kernel stack. */
+        if (t && target != p)
+            for (UINT32 c = 0; c < platform.discovered_cpus; ++c)
+                if (cpus[c].current == t ||
+                    __atomic_load_n(&cpus[c].stack_owner, __ATOMIC_ACQUIRE) == t)
+                    safe = FALSE;
+        k_spin_unlock(&sched_lock, irq);
+        if (!safe) {
+            e = K_EBUSY;
+            goto memory_done;
+        }
+        if (r->operation == K_ADMIN_MAP_AT) {
+            if (r->value > 7)
+                e = K_EINVAL;
+            else
+                e = admin_map_at(target, r->address, r->length, (UINT32)r->value);
+            goto memory_done;
+        }
+        if (!r->length || r->length > 4096) {
+            e = K_EINVAL;
+            goto memory_done;
+        }
+        UINT8 buf[4096];
+        BOOLEAN write = r->operation == K_ADMIN_MEM_WRITE;
+        e = k_as_check(p->as, r->buffer, r->length, !write);
+        if (e)
+            goto memory_done;
+        e = k_as_check(target->as, r->address, r->length, write);
+        if (e)
+            goto memory_done;
+        if (write) {
+            e = k_copy_from_user(p->as, buf, r->buffer, r->length);
+            if (!e)
+                e = k_copy_to_user(target->as, r->address, buf, r->length);
+        } else {
+            e = k_copy_from_user(target->as, buf, r->address, r->length);
+            if (!e)
+                e = k_copy_to_user(p->as, r->buffer, buf, r->length);
+        }
+    memory_done:
+        k_mutex_unlock(&process_mutex);
+        return e;
+    }
+    if (r->operation == K_ADMIN_INPUT_CLAIM || r->operation == K_ADMIN_INPUT_RELEASE ||
+        r->operation == K_ADMIN_INPUT_READ) {
+        if (k_cpu_id() != 0)
+            return K_EPERM;
+        if (r->operation == K_ADMIN_INPUT_CLAIM) {
+            UINT64 irq = k_spin_lock(&sched_lock);
+            int e = input_owner && input_owner != p->id ? K_EBUSY : 0;
+            if (!e)
+                input_owner = p->id;
+            k_spin_unlock(&sched_lock, irq);
+            return e;
+        }
+        if (input_owner != p->id)
+            return K_EPERM;
+        if (r->operation == K_ADMIN_INPUT_RELEASE) {
+            input_owner = 0;
+            return 0;
+        }
+        if (r->length != sizeof(k_input_report))
+            return K_EINVAL;
+        int e = k_as_check(p->as, r->buffer, sizeof(k_input_report), TRUE);
+        if (e)
+            return e;
+        k_input_report report;
+        k_input_pump();
+        e = k_input_read(&report);
+        return e ? e : k_copy_to_user(p->as, r->buffer, &report, sizeof(report));
+    }
+    if (r->operation < K_ADMIN_DISK_READ || r->operation > K_ADMIN_PART_RELEASE)
+        return K_ENOTSUP;
+    int e = k_mutex_lock(&process_mutex);
+    if (e)
+        return e;
+    UINT32 disk_id = 0;
+    UINT64 start = 0, limit = 0;
+    k_partition_info *part = NULL;
+    if (r->operation == K_ADMIN_DISK_READ) {
+        if (r->resource >= k_disk_count()) {
+            e = K_ENOENT;
+            goto disk_done;
+        }
+        disk_id = r->resource;
+        limit = disks[disk_id].info.sectors;
+    } else {
+        if (r->resource >= partition_count) {
+            e = K_ENOENT;
+            goto disk_done;
+        }
+        part = &partitions[r->resource];
+        disk_id = part->disk;
+        start = part->start;
+        limit = part->sectors;
+        if (r->operation == K_ADMIN_PART_CLAIM) {
+            if (part->read_only || part->mounted || part->failed) {
+                e = K_EROFS;
+                goto disk_done;
+            }
+            if (part->owner_pid && part->owner_pid != p->id) {
+                e = K_EBUSY;
+                goto disk_done;
+            }
+            /* Publish only validated, non-overlapping partitions before SMP. */
+            part->owner_pid = p->id;
+            e = 0;
+            goto disk_done;
+        }
+        if (part->owner_pid != p->id) {
+            e = K_EPERM;
+            goto disk_done;
+        }
+        if (r->operation == K_ADMIN_PART_RELEASE) {
+            part->owner_pid = 0;
+            e = 0;
+            goto disk_done;
+        }
+        if (part->failed) {
+            e = K_EROFS;
+            goto disk_done;
+        }
+    }
+    UINT32 sector = disks[disk_id].info.sector_size;
+    if (!r->length || r->length > 4096 || r->length % sector || r->address >= limit ||
+        r->length / sector > limit - r->address) {
+        e = K_EINVAL;
+        goto disk_done;
+    }
+    UINT8 buffer[4096];
+    BOOLEAN write = r->operation == K_ADMIN_PART_WRITE;
+    e = k_as_check(p->as, r->buffer, r->length, !write);
+    if (e)
+        goto disk_done;
+    if (write) {
+        e = k_copy_from_user(p->as, buffer, r->buffer, r->length);
+        if (e)
+            goto disk_done;
+        e = disk_write_fs(disk_id, start + r->address, (UINT32)(r->length / sector), buffer,
+                          r->length);
+        if (!e)
+            e = disk_flush(disk_id);
+        if (e)
+            part->failed = 1;
+    } else {
+        e = k_disk_read(disk_id, start + r->address, (UINT32)(r->length / sector), buffer,
+                        r->length);
+        if (!e)
+            e = k_copy_to_user(p->as, r->buffer, buffer, r->length);
+    }
+disk_done:
+    k_mutex_unlock(&process_mutex);
+    return e;
+}
+static int user_args(k_process *p, UINT64 address, char out[K_PROCESS_ARGS_MAX])
+{
+    if (!address) {
+        out[0] = 0;
+        return 0;
+    }
+    for (UINT32 i = 0; i < K_PROCESS_ARGS_MAX; ++i) {
+        if (address > K_USER_CANON_LIMIT - 1 - i ||
+            k_copy_from_user(p->as, &out[i], address + i, 1))
+            return K_EFAULT;
+        if (!out[i])
+            return 0;
+    }
+    return K_E2BIG;
+}
+static INT64 syscall_extended(k_process *p, task *t, irq_frame *f)
+{
+    switch (f->rax) {
+    case K_SYS_SPAWN: {
+        char path[K_PATH_MAX], args[K_PROCESS_ARGS_MAX];
+        int e = user_string(p, f->rdi, path);
+        if (!e)
+            e = user_args(p, f->rsi, args);
+        if (e)
+            return e;
+        if (f->rdx != K_EXEC_RING1 && f->rdx != K_EXEC_RING3)
+            return K_EINVAL;
+        if (f->r10 != ~0ULL && f->r10 > K_CPU_AUTO)
+            return K_EINVAL;
+        UINT32 pid;
+        e = k_process_launch(path, args, (UINT32)f->rdx, (UINT32)f->r10, p->id, &pid);
+        return e ? e : (INT64)pid;
+    }
+    case K_SYS_PROCINFO: {
+        if (f->rdi >= MAX_PROCESSES)
+            return K_EINVAL;
+        int e = k_as_check(p->as, f->rsi, sizeof(k_process_info), TRUE);
+        if (e)
+            return e;
+        k_process_info info;
+        e = k_process_get((UINT32)f->rdi, &info);
+        return e ? e : k_copy_to_user(p->as, f->rsi, &info, sizeof(info));
+    }
+    case K_SYS_WAITPID: {
+        if (!f->rdi || f->rdi > 0xffffffff || f->rdx & ~3ULL)
+            return K_EINVAL;
+        if (f->rsi && k_as_check(p->as, f->rsi, sizeof(k_process_info), TRUE))
+            return K_EFAULT;
+        for (;;) {
+            int e = k_mutex_lock(&process_mutex);
+            if (e)
+                return e;
+            k_process *target = process_by_pid((UINT32)f->rdi);
+            if (!target || target == p)
+                e = K_ENOENT;
+            else if (target->parent != p->id && p->execution_class != K_EXEC_RING1)
+                e = K_EPERM;
+            else if (target->state != K_TASK_ZOMBIE)
+                e = K_EAGAIN;
+            else {
+                k_process_info info;
+                e = k_process_query(target->id, &info);
+                if (!e && f->rsi)
+                    e = k_copy_to_user(p->as, f->rsi, &info, sizeof(info));
+                if (!e && (f->rdx & K_WAIT_REAP))
+                    e = process_destroy_locked(target);
+                if (e == K_EBUSY)
+                    e = K_EAGAIN;
+            }
+            k_mutex_unlock(&process_mutex);
+            if (e != K_EAGAIN || (f->rdx & K_WAIT_NOHANG) || t->control_request)
+                return e;
+            k_sleep(1);
+        }
+    }
+    case K_SYS_CONTROL: {
+        if (f->rdi > 0xffffffff || f->rsi > 0xffffffff)
+            return K_EINVAL;
+        int e = k_mutex_lock(&process_mutex);
+        if (e)
+            return e;
+        k_process *target = process_by_pid((UINT32)f->rdi);
+        if (!target)
+            e = K_ENOENT;
+        else if (target != p && target->parent != p->id && p->execution_class != K_EXEC_RING1)
+            e = K_EPERM;
+        else
+            e = process_control_locked(target->id, (UINT32)f->rsi);
+        k_mutex_unlock(&process_mutex);
+        return e;
+    }
+    case K_SYS_ADMIN: {
+        k_admin_request r;
+        int e = k_copy_from_user(p->as, &r, f->rdi, sizeof(r));
+        return e ? e : admin_operation(p, &r);
+    }
+    case K_SYS_IDENTITY: {
+        k_identity id;
+        int e = k_process_identity(p->id, &id);
+        return e ? e : k_copy_to_user(p->as, f->rdi, &id, sizeof(id));
+    }
+    case K_SYS_SERVICE_REGISTER:
+    case K_SYS_SERVICE_LOOKUP: {
+        char name[K_PATH_MAX];
+        int e = user_string(p, f->rdi, name);
+        if (e)
+            return e;
+        if (f->rax == K_SYS_SERVICE_REGISTER)
+            return service_register(p, name);
+        UINT32 tid;
+        e = k_service_lookup(name, &tid);
+        return e ? e : (INT64)tid;
+    }
+    case K_SYS_SERVICE_REPLY: {
+        if (f->rdx > K_IPC_BYTES || f->rdi > 0xffffffff)
+            return K_EINVAL;
+        if (p->execution_class != K_EXEC_RING1)
+            return K_EPERM;
+        UINT8 bytes[K_IPC_BYTES];
+        int e = k_copy_from_user(p->as, bytes, f->rsi, f->rdx);
+        return e ? e : k_ipc_send((UINT32)f->rdi, bytes, (UINT32)f->rdx);
+    }
+    case K_SYS_GETCPU:
+        return k_cpu_id();
+    case K_SYS_TLSBASE:
+        return (INT64)p->tls;
+    case K_SYS_GETARGS: {
+        UINTN n = str_len(p->arguments) + 1;
+        if (f->rsi < n)
+            return K_E2BIG;
+        int e = k_copy_to_user(p->as, f->rdi, p->arguments, n);
+        return e ? e : (INT64)(n - 1);
+    }
+    case K_SYS_SEEK: {
+        UINT64 fd = f->rdi;
+        if (fd < 3 || fd >= 16 || !p->fd_used[fd] || f->rdx > 2)
+            return K_EINVAL;
+        if (f->rdx == 2) {
+            int e = k_vfs_stat(&p->files[fd]);
+            if (e)
+                return e;
+        }
+        UINT64 base = f->rdx == 0 ? 0 : f->rdx == 1 ? p->fd_offset[fd] : p->files[fd].size;
+        if (base > 0x7fffffffffffffffULL)
+            return K_EINVAL;
+        INT64 off = (INT64)f->rsi;
+        if ((off < 0 && 0 - (UINT64)off > base) ||
+            (off >= 0 && (UINT64)off > 0x7fffffffffffffffULL - base))
+            return K_EINVAL;
+        p->fd_offset[fd] = base + (UINT64)off;
+        return (INT64)p->fd_offset[fd];
+    }
+    case K_SYS_MAP: {
+        if (f->rdx > 7)
+            return K_EINVAL;
+        UINT64 address;
+        int e = k_as_alloc(p->as, f->rdi, f->rsi, (UINT32)f->rdx, &address);
+        return e ? e : (INT64)address;
+    }
+    case K_SYS_DISKINFO: {
+        if (p->execution_class != K_EXEC_RING1)
+            return K_EPERM;
+        if (f->rdi > 0xffffffff)
+            return K_EINVAL;
+        k_disk_info info;
+        int e = k_disk_get((UINT32)f->rdi, &info);
+        return e ? e : k_copy_to_user(p->as, f->rsi, &info, sizeof(info));
+    }
+    case K_SYS_PARTITIONINFO: {
+        if (p->execution_class != K_EXEC_RING1)
+            return K_EPERM;
+        if (f->rdi > 0xffffffff)
+            return K_EINVAL;
+        k_partition_info info;
+        int e = k_partition_get((UINT32)f->rdi, &info);
+        return e ? e : k_copy_to_user(p->as, f->rsi, &info, sizeof(info));
+    }
+    default:
         return K_ENOTSUP;
     }
 }
 
-/* Native xHCI and i8042 byte transports. Input interpretation lives in the OS. */
 static void xhci_mdelay(UINT32 ms)
 {
     while (ms--)
         k_delay_us(1000);
 }
-static UINT64 usb_dma_page(void)
-{
-    return k_pmm_alloc_pages(1, 0x100000000ULL);
-}
-/* Raw transport only: device semantics and report decoding belong to the OS. */
+static UINT64 usb_dma_page(void) { return k_pmm_alloc_pages(1, 0x100000000ULL); }
+/* Input drivers expose raw transport; report semantics belong to the OS. */
 #define RAW_QUEUE_DEPTH 256
 static k_input_report raw_reports[RAW_QUEUE_DEPTH];
 static UINT32 raw_head, raw_count, raw_lost[K_INPUT_MAX_DEVICES];
@@ -6327,7 +9901,7 @@ static void i8042_receive(UINT8 status, UINT8 value)
 }
 static void ps2_irq(void)
 {
-    /* Both i8042 ports share 0x60. Route by AUX status, never by IRQ number. */
+    /* Both i8042 ports share 0x60; route bytes by AUX status. */
     for (UINT32 n = 0; n < 32; ++n) {
         UINT8 s = inb(0x64);
         if (!(s & 1))
@@ -6354,7 +9928,7 @@ static int i8042_controller_byte(UINT8 command)
         outb(0x64, command);
     return e;
 }
-/* Controller response, with both device clocks disabled by the caller. */
+/* Controller response while both device clocks are disabled. */
 static int i8042_controller_read(UINT8 *out)
 {
     for (UINT32 n = 0; n < 2000; ++n) {
@@ -6380,12 +9954,12 @@ int k_i8042_enable(UINT32 port)
     if (e)
         return e;
     UINT64 irq = k_irq_save();
-    /* Keep translation and all unrelated firmware configuration bits. */
+    /* Preserve unrelated firmware i8042 configuration bits. */
     UINT8 cfg = 0;
     e = i8042_controller_byte(0xad);
     if (!e)
         e = i8042_controller_byte(0xa7);
-    ps2_irq(); /* retain pending device bytes instead of throwing them away */
+    ps2_irq();
     if (!e)
         e = i8042_controller_byte(0x20);
     if (!e)
@@ -6413,7 +9987,7 @@ int k_i8042_enable(UINT32 port)
         if (!e)
             outb(0x60, cfg);
     }
-    /* Restore the primary port even if an absent second port failed its test. */
+    /* Restore port 1 even if port 2 testing fails. */
     (void)i8042_controller_byte(0xae);
     if (!e && i8042_enabled[1])
         e = i8042_controller_byte(0xa8);
@@ -6447,7 +10021,7 @@ int k_i8042_exchange(UINT32 port, UINT8 byte, UINT8 *response, UINT32 size)
     if (e)
         return e;
     UINT64 irq = k_irq_save();
-    /* ACK/RESEND are transport handshakes. The command byte is OS supplied. */
+    /* ACK/RESEND are transport handshakes; command semantics belong to the OS. */
     for (UINT32 retry = 0; retry < 3; ++retry) {
         if (port)
             e = i8042_controller_byte(0xd4);
@@ -6483,7 +10057,7 @@ int k_i8042_exchange(UINT32 port, UINT8 byte, UINT8 *response, UINT32 size)
     return e;
 }
 
-/* TRB fields MUST be volatile so the compiler doesn't cache them! */
+/* TRB fields are volatile because the controller updates them asynchronously. */
 typedef struct {
     volatile UINT32 param1;
     volatile UINT32 param2;
@@ -6684,8 +10258,6 @@ static BOOLEAN xhci_transfer_ok(UINT64 event)
     return (comp_code == 1 || comp_code == 13);
 }
 
-// endpoint internal conversion
-
 static UINT8 usb_interval_to_xhci(UINT8 bInterval, UINT32 port_speed)
 {
     if (port_speed == 3 || port_speed >= 4) {
@@ -6703,8 +10275,7 @@ static UINT8 usb_interval_to_xhci(UINT8 bInterval, UINT32 port_speed)
     }
 }
 
-/* An interrupt-IN pipe is a byte stream with descriptor metadata. No usages,
- * scan codes, buttons, coordinates or device-specific packets are decoded. */
+/* Interrupt-IN endpoints expose bytes plus descriptor metadata; no HID semantics here. */
 static BOOLEAN xhci_configure_raw(xhci_dev_t *dev, usb_raw_endpoint *ep, UINT8 address,
                                   UINT16 packet, UINT8 interval, UINT32 speed, UINT8 burst,
                                   UINT16 esit)
@@ -6742,7 +10313,7 @@ static BOOLEAN xhci_configure_raw(xhci_dev_t *dev, usb_raw_endpoint *ep, UINT8 a
     xhci_enqueue_cmd((UINT64)(UINTN)ctx, 0, (dev->slot << 24) | (12U << 10));
     xhci_ring_doorbell(0, 0);
     BOOLEAN ok = xhci_transfer_ok(xhci_wait_event(33));
-    /* Never free DMA contexts after a timeout: the controller may still use them. */
+    /* Do not free timed-out DMA contexts; hardware may still reference them. */
     if (!xhci_failed)
         pmm_free_page((UINT64)(UINTN)ctx);
     return ok;
@@ -6833,8 +10404,6 @@ static void xhci_pump_raw(void)
     }
 }
 
-// Hub helpers
-
 static BOOLEAN hub_get_descriptor(xhci_dev_t *dev, BOOLEAN superspeed, void *buf, UINT16 len)
 {
     UINT16 desc_type = superspeed ? 0x2A00 : 0x2900;
@@ -6864,8 +10433,6 @@ static void hub_clear_port_feature(xhci_dev_t *dev, UINT8 port, UINT16 feature)
 {
     xhci_control_no_data(dev, usb_setup_packet(0x23, HUB_REQ_CLEAR_FEATURE, feature, port, 0));
 }
-
-// slot + device managment
 
 static void xhci_print_completion(CONST char *label, UINT64 event)
 {
@@ -6909,7 +10476,7 @@ static BOOLEAN xhci_address_device(xhci_dev_t *dev, usb_topo_t *topo, UINT32 por
     input_ctx[g_context_dwords + 2] =
         ((UINT32)topo->parent_slot) | ((UINT32)topo->parent_port << 8);
 
-    input_ctx[2 * g_context_dwords + 1] = (3 << 1) /* Err */ | (4U << 3) | (max_packet << 16);
+    input_ctx[2 * g_context_dwords + 1] = (3 << 1)   | (4U << 3) | (max_packet << 16);
     input_ctx[2 * g_context_dwords + 2] = (UINT32)(UINT64)(UINTN)dev->ep0_ring | 1;
     input_ctx[2 * g_context_dwords + 3] = (UINT32)((UINT64)(UINTN)dev->ep0_ring >> 32);
     input_ctx[2 * g_context_dwords + 4] = 8;
@@ -6929,7 +10496,7 @@ static BOOLEAN xhci_set_hub_slot_info(xhci_dev_t *dev, UINT8 num_ports, BOOLEAN 
     for (UINT32 i = 0; i < 1024; i++)
         input_ctx[i] = 0;
 
-    input_ctx[1] = 0x01; /* Add Slot Context only */
+    input_ctx[1] = 0x01;
 
     UINT32 *old = (UINT32 *)(UINTN)g_dcbaa[dev->slot];
     for (UINT32 i = 0; i < g_context_dwords; ++i)
@@ -6954,7 +10521,7 @@ static BOOLEAN xhci_finish_interfaces(xhci_dev_t *dev, const UINT8 *cfg, UINT16 
         return FALSE;
     BOOLEAN configured = FALSE;
     UINT32 added = 0;
-    /* Walk every alternate-zero HID interface, including composite receivers. */
+    /* Enumerate alternate-zero HID interfaces, including composite receivers. */
     for (UINT32 pos = cfg[0]; pos + 2 <= size;) {
         UINT32 len = cfg[pos];
         if (len < 2 || len > size - pos)
@@ -6985,7 +10552,7 @@ static BOOLEAN xhci_finish_interfaces(xhci_dev_t *dev, const UINT8 *cfg, UINT16 
                     burst = cfg[end + n + 2];
                     esit = rd16(cfg + end + n + 4);
                     if (cfg[end + n + 3] & 3)
-                        address = 0; /* no high-bandwidth SS Mult input endpoint */
+                        address = 0;
                 }
             }
             end += n;
@@ -7088,7 +10655,6 @@ static BOOLEAN xhci_probe_device(usb_topo_t *topo, UINT32 port_speed)
             actual_max_packet != 64 && actual_max_packet != 512)
             goto fail_disable;
 
-        /* If the device has a different max packet size, update the xHCI context */
         if (actual_max_packet != initial_max_packet && actual_max_packet != 0) {
             con_print("xhci: updating EP0 max packet to ");
             con_print_uint(actual_max_packet);
@@ -7101,6 +10667,7 @@ static BOOLEAN xhci_probe_device(usb_topo_t *topo, UINT32 port_speed)
                 input_ctx[1] = 0x02;
 
                 UINT32 *output_ctx = (UINT32 *)(UINTN)g_dcbaa[dev.slot];
+
                 for (UINT32 i = 0; i < g_context_dwords; i++) {
                     input_ctx[2 * g_context_dwords + i] = output_ctx[1 * g_context_dwords + i];
                 }
@@ -7116,7 +10683,6 @@ static BOOLEAN xhci_probe_device(usb_topo_t *topo, UINT32 port_speed)
             }
         }
 
-        /* Now safely read the full 18 bytes */
         res =
             xhci_control_in(&dev, usb_setup_packet(0x80, 0x06, 0x0100, 0, 18), (void *)devdesc, 18);
         if (!xhci_transfer_ok(res)) {
@@ -7170,7 +10736,7 @@ static BOOLEAN xhci_probe_device(usb_topo_t *topo, UINT32 port_speed)
             for (UINT8 p = 1; p <= num_ports && p <= 15; p++) {
                 hub_set_port_feature(&dev, p, HUB_FEATURE_PORT_POWER);
             }
-            xhci_mdelay(200); /* power settle, per USB spec (increased for hardware) */
+            xhci_mdelay(200);
 
             for (UINT8 p = 1; p <= num_ports && p <= 15; p++) {
                 UINT32 status;
@@ -7178,7 +10744,7 @@ static BOOLEAN xhci_probe_device(usb_topo_t *topo, UINT32 port_speed)
                 if (!hub_get_port_status(&dev, p, &status))
                     continue;
                 if (!(status & 0x0001))
-                    continue; /* nothing connected */
+                    continue;
 
                 hub_clear_port_feature(&dev, p, HUB_FEATURE_C_PORT_CONNECTION);
                 hub_set_port_feature(&dev, p, HUB_FEATURE_PORT_RESET);
@@ -7188,7 +10754,7 @@ static BOOLEAN xhci_probe_device(usb_topo_t *topo, UINT32 port_speed)
                     if (!hub_get_port_status(&dev, p, &status))
                         break;
                     if (status & 0x00100000)
-                        break; /* C_PORT_RESET */
+                        break;
                     xhci_mdelay(1);
                 } while (--to);
 
@@ -7202,11 +10768,11 @@ static BOOLEAN xhci_probe_device(usb_topo_t *topo, UINT32 port_speed)
                 if (is_ss)
                     child_speed = 4;
                 else if (status & 0x0400)
-                    child_speed = 3; /* High */
+                    child_speed = 3;
                 else if (status & 0x0200)
-                    child_speed = 2; /* Low  */
+                    child_speed = 2;
                 else
-                    child_speed = 1; /* Full */
+                    child_speed = 1;
 
                 usb_topo_t child = *topo;
                 child.route_string |= ((UINT32)p << (4 * (topo->tier - 1)));
@@ -7227,7 +10793,7 @@ static BOOLEAN xhci_probe_device(usb_topo_t *topo, UINT32 port_speed)
                 if (xhci_failed)
                     return FALSE;
             }
-            return TRUE; /* retain hub and enumerate every downstream port */
+            return TRUE; /* Keep hub slots alive while enumerating downstream ports. */
         }
 
         {
@@ -7272,7 +10838,6 @@ static BOOLEAN xhci_probe_device(usb_topo_t *topo, UINT32 port_speed)
             con_print_uint(total_len);
             con_print("\n");
 
-            /* Dump every descriptor header we walk past, so we can see all interfaces */
             {
                 UINT16 pos = v_usb_desc_buf[0];
                 while (pos + 2 <= total_len) {
@@ -7314,7 +10879,7 @@ fail_disable:
     for (UINT32 i = 0; i < usb_endpoint_count; ++i)
         if (usb_endpoints[i].controller == xhci_current->index && usb_endpoints[i].slot == dev.slot)
             usb_endpoints[i].info.online = FALSE;
-    xhci_enqueue_cmd(0, 0, (dev.slot << 24) | (10U << 10)); /* Disable Slot */
+    xhci_enqueue_cmd(0, 0, (dev.slot << 24) | (10U << 10));
     xhci_ring_doorbell(0, 0);
     xhci_wait_event(33);
     return FALSE;
@@ -7407,7 +10972,7 @@ static UINT32 xhci_find_controllers(UINT64 *out_bases, UINT32 max_out)
                     if (!phys_base || (bar0 & 1))
                         continue;
                     UINT16 bdf = (UINT16)((bus << 8) | (slot << 3) | func);
-                    pci_command(bdf, 2 | 0x400, 0); /* memory and INTx-disable; rings are polled */
+                    pci_command(bdf, 2 | 0x400, 0);
 
                     con_print("xhci: controller at PCI ");
                     con_print_uint(bus);
@@ -7531,14 +11096,14 @@ static BOOLEAN xhci_try_controller(UINT64 phys_base)
     con_print("\n");
     volatile UINT32 *port_regs = (volatile UINT32 *)(xhci_op_regs + 0x400);
 
-    /* Unconditionally Power ON all ports (ignoring PPC because motherboards lie) */
+    /* Power ports even when PPC reporting is unreliable. */
     for (UINT32 pi = 0; pi < max_ports; pi++) {
         UINT32 portsc = port_regs[pi * 4];
         port_regs[pi * 4] = (portsc & ~PORTSC_RW1C_MASK) | (1U << 9);
     }
 
     con_print("xhci: Powered on all ports. Waiting 300ms for devices to connect...\n");
-    xhci_mdelay(300); /* Wait a full 300ms for slow RGB keyboards to assert connection */
+    xhci_mdelay(300);
     con_print("xhci: Controller running.\n");
 
     UINT32 hccparams1 = *(volatile UINT32 *)(xhci_cap_regs + 0x10);
@@ -7556,7 +11121,7 @@ static BOOLEAN xhci_try_controller(UINT64 phys_base)
         UINT32 portsc = port_regs[port_index * 4];
 
         if (!(portsc & 1)) {
-            continue; /* nothing connected */
+            continue;
         }
 
         con_print("xhci: probing root port ");
@@ -7564,22 +11129,22 @@ static BOOLEAN xhci_try_controller(UINT64 phys_base)
         con_print("\n");
 
         if (((portsc >> 10) & 0x0F) < 4) {
-            /* Mask W1C bits and set Port Reset (PR - bit 4) */
+            /* Mask xHCI W1C bits when asserting port reset. */
             port_regs[port_index * 4] = (portsc & ~PORTSC_RW1C_MASK) | (1U << 4);
 
-            xhci_mdelay(50); /* Let hardware stabilize the reset lines */
+            xhci_mdelay(50);
 
             UINT64 timeout = 1000;
             while (timeout-- && (port_regs[port_index * 4] & (1U << 4))) {
                 xhci_mdelay(1);
             }
 
-            /* Write 1 to PRC (Bit 21) to clear the reset change event */
+            /* Clear PRC with write-one-to-clear. */
             port_regs[port_index * 4] =
                 (port_regs[port_index * 4] & ~PORTSC_RW1C_MASK) | (1U << 21);
             xhci_mdelay(20);
         } else {
-            /* Wait for SuperSpeed port to automatically transition to Enabled */
+
             UINT64 timeout = 100;
             while (timeout-- && !(port_regs[port_index * 4] & (1U << 1))) {
                 xhci_mdelay(1);
@@ -7644,10 +11209,7 @@ void kernel_usb_init(void)
     con_print_uint(usb_endpoint_count);
     con_print("\n");
 }
-UINT32 k_input_count(void)
-{
-    return usb_endpoint_count + (platform.ps2 ? 2 : 0);
-}
+UINT32 k_input_count(void) { return usb_endpoint_count + (platform.ps2 ? 2 : 0); }
 int k_input_get(UINT32 index, k_input_device *out)
 {
     if (!out || k_cpu_id())
@@ -7693,7 +11255,7 @@ int k_usb_input_protocol(UINT32 id, UINT16 protocol)
     if (!ep->info.online || xhci_failed)
         e = K_EIO;
     else if (ep->pending || ep->enabled)
-        e = K_EBUSY; /* choose protocol before starting this byte stream */
+        e = K_EBUSY;
     else {
         xhci_dev_t *dev = &xhci_current->devices[ep->slot];
         e = xhci_transfer_ok(xhci_control_no_data(
@@ -7721,7 +11283,7 @@ void k_input_pump(void)
         return;
     if (platform.ps2) {
         UINT64 f = k_irq_save();
-        ps2_irq(); /* also works when firmware supplied no usable IRQ routing */
+        ps2_irq(); /* Polling path also works without usable firmware IRQ routing. */
         k_irq_restore(f);
     }
     if (k_mutex_trylock(&input_transport_lock))

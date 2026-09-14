@@ -6,8 +6,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* x86-64 UEFI kernel API. No symbols or policy are imported from os.c.
- * EFI is used only for boot descriptions; kernel code calls no EFI services. */
+/* x86-64 UEFI kernel API. os.c supplies policy. */
 #define K_OK 0
 #define K_EINVAL (-1)
 #define K_ENOMEM (-2)
@@ -33,10 +32,10 @@ UINT32 kernel_fb_height(void);
 UINT32 kernel_con_cols(void);
 UINT32 kernel_con_rows(void);
 BOOLEAN kernel_console_buffered(void);
-BOOLEAN kernel_fb_pat_wc(void); /* PAT requests WC; firmware MTRRs may restrict it. */
+BOOLEAN kernel_fb_pat_wc(void); /* PAT requests WC; MTRRs may still restrict it. */
 void kernel_console_clear(void);
-UINT32 kernel_console_scroll(INT32 rows); /* positive = older lines; returns view offset */
-/* Generic copied bitmap overlay, at most 32x32. ARGB: alpha 0 transparent, nonzero opaque. A zero dimension hides it. The OS chooses shape/position. */
+UINT32 kernel_console_scroll(INT32 rows); /* positive = older lines */
+/* Copied 32x32 ARGB overlay; zero size hides it. */
 int kernel_overlay_set(INT32 x, INT32 y, UINT32 width, UINT32 height, const UINT32 *argb);
 void kernel_overlay_move(INT32 x, INT32 y);
 void con_putc(char);
@@ -46,12 +45,8 @@ void con_print_int(INT32);
 void con_print_2digit(UINT16);
 void con_print_hex(UINT64);
 void kernel_usb_init(void);
-/* Generic transport API. Numeric USB interface metadata and raw reports only;
- * the OS owns keyboard layouts, mouse packets, HID usages and input policy.
- * Devices are enumerated at boot; attach before boot (no runtime re-enumeration).
- * Up to 8 xHCI controllers, 30 USB interfaces and 2 i8042 ports. CPU 0 callers.
- * One OS input task should pump/read. Queue overflow is counted per device;
- * consumers must release stale state and resynchronize when 'lost' changes. */
+/* Raw input transport only; the OS owns HID/keyboard/mouse semantics.
+ * Devices are enumerated at boot; queue loss requires resynchronization. */
 #define K_INPUT_MAX_DEVICES 32
 #define K_INPUT_REPORT_MAX 1024
 #define K_INPUT_DESCRIPTOR_MAX 4096
@@ -131,13 +126,13 @@ UINT64 k_pmm_free_count(void);
 int kernel_vmm_init(void);
 UINT64 *kernel_get_pml4(void);
 int vmm_map_page(UINT64 *, UINT64, UINT64, UINT64);
-int vmm_unmap_page(UINT64 *, UINT64);
+int vmm_unmap_page(UINT64 *, UINT64); /* does not free the physical page */
 int vmm_translate(UINT64 *, UINT64, UINT64 *, UINT64 *);
 int k_mmio_map(UINT64 physical, UINT64 bytes);
 
 typedef struct k_address_space k_address_space;
 k_address_space *k_as_create(void);
-int k_as_destroy(k_address_space *);
+int k_as_destroy(k_address_space *); /* process-owned spaces return K_EBUSY */
 int k_as_alloc(k_address_space *, UINT64 bytes, UINT64 alignment, UINT32 rwx, UINT64 *base);
 int k_as_check(k_address_space *, UINT64 address, UINT64 bytes, BOOLEAN write);
 int k_copy_to_user(k_address_space *, UINT64, const void *, UINT64);
@@ -152,7 +147,8 @@ enum k_task_state {
     K_TASK_RUNNING,
     K_TASK_SLEEPING,
     K_TASK_BLOCKED,
-    K_TASK_ZOMBIE
+    K_TASK_ZOMBIE,
+    K_TASK_STOPPED
 };
 typedef struct {
     UINT32 id, cpu, state, weight, process_id;
@@ -171,8 +167,7 @@ typedef struct {
     const char *timer_source;
     const char *dma_reason;
 } k_platform_info;
-/* rsdp and trampoline (one EFI-reserved page below 1 MiB) may be zero.
- * No AP starts until k_smp_start(). */
+/* rsdp/trampoline may be zero; APs start only in k_smp_start(). */
 int k_platform_init(UINT64 rsdp, UINT64 trampoline);
 const k_platform_info *k_platform(void);
 int k_scheduler_init(void);
@@ -198,7 +193,7 @@ typedef struct {
     UINT32 sender, size;
     UINT8 bytes[K_IPC_BYTES];
 } k_message;
-/* Each task has a bounded mailbox. A user process can send to itself or to target tasks explicitly granted by k_ipc_grant. Kernel tasks can send to any live task. Receive is nonblocking. IDs are not reused during a boot. */
+/* Bounded per-task mailbox. User sends require an explicit IPC grant. */
 int k_ipc_send(UINT32 task, const void *, UINT32);
 int k_ipc_receive(k_message *);
 int k_ipc_grant(UINT32 process_id, UINT32 target_task);
@@ -216,7 +211,7 @@ int k_storage_init(void);
 UINT32 k_disk_count(void);
 int k_disk_get(UINT32, k_disk_info *);
 int k_disk_read(UINT32 disk, UINT64 lba, UINT32 sectors, void *, UINT64 buffer_bytes);
-/* Raw physical writes remain blocked. Filesystem-private native writes are available through k_vfs_put/k_vfs_write/k_vfs_mkdir. This raw API writes RAM disks only, so diagnostics cannot accidentally overwrite a partition table. No physical format, erase, trim or sanitize command is implemented. */
+/* Public raw physical writes are blocked; filesystem code uses checked private writes. */
 int k_disk_write(UINT32 disk, UINT64 lba, UINT32 sectors, const void *, UINT64 buffer_bytes);
 int k_ramdisk_create(UINT32 sectors, UINT32 *id);
 
@@ -232,32 +227,18 @@ typedef struct {
     UINT64 directory_offset;
 } k_dirent;
 typedef void (*k_dir_callback)(const k_dirent *, void *);
-/* Storage and namespace policy calls belong on CPU 0. Listing callbacks must not reenter VFS. k_vfs_put creates/replaces a RAM or FAT16/32 file (<=4 MiB).
- * k_vfs_write preserves other bytes; offset=UINT64_MAX means atomic append
- * under the VFS lock. No delete/rename API or executable permission bit is
- * supplied. RIEF validation determines executability; suffixes are irrelevant.
- * FAT16/32 writes require a clean, fully validated filesystem and working
- * native device flush. FAT12 and raw physical disk objects stay read-only.
- * New FAT names use ASCII long-name entries (up to 255 characters). Directory
- * creation is supported. All successful physical mutations flush before return.
- * The first write audits cluster ownership/mirrors and caches up to 64 MiB
- * of FAT, with at most 4096 directories; unsupported/invalid volumes refuse
- * writes. A mutation error freezes that volume read-only until reboot/repair.
- * Copy-on-write ordering and dirty flags do not make FAT power-fail atomic.
- * k_root_bind("name", "/path") provides @name/relative addressing; '..' cannot
- * escape that root. The OS creates /system, /users/pavlkon and their aliases.
- * Discovered FAT volumes appear at /volumes/diskNpM and @diskNpM; @diskN names
- * the first supported FAT volume on that device. Enumeration is not a stable
- * device identity. @usb0 is available only if a caller explicitly binds it;
- * this build has no USB mass-storage driver. */
+/* VFS calls are serialized; mount/root registration is boot policy.
+ * Writable FAT16/32, ext4 and NTFS mutations are bounded and flushed.
+ * Dirty/recovery-required volumes refuse writes; I/O failure freezes writes. */
 int k_vfs_init(void);
 int k_vfs_mkdir(const char *);
 int k_vfs_put(const char *, const void *, UINT64);
-int k_vfs_create(const char *, k_file *);
+int k_vfs_create(const char *, k_file *); /* exclusive create */
 int k_vfs_write(k_file *, UINT64 offset, const void *, UINT64, UINT64 *written);
 int k_vfs_sync(void);
-int k_vfs_mount_ramfat(UINT32 disk);
+int k_vfs_mount_ramfat(UINT32 disk); /* RAM disks only */
 int k_vfs_open(const char *, k_file *);
+int k_vfs_stat(k_file *);
 int k_vfs_read(const k_file *, UINT64 offset, void *, UINT64 bytes, UINT64 *read);
 int k_vfs_list(const char *, k_dir_callback, void *);
 int k_vfs_mount_disks(void);
@@ -266,35 +247,11 @@ int k_path_resolve(const char *path, const char *cwd, char out[K_PATH_MAX]);
 void k_roots_list(void (*callback)(const char *, const char *, void *), void *);
 void k_mounts_list(void (*callback)(const char *, const char *, void *), void *);
 
-/* RIEF v1.0: all integers little-endian, fixed wire sizes, reserved fields zero.
- * No on-disk structure requests a virtual or physical address. The loader
- * allocates every region independently, zero-fills memory_size - file_size,
- * applies relocations through supervisor aliases and enforces user W^X.
- *
- * Compiler contract:
- * - Header size >= 96, <= 4096; extension bytes must be zero. Version 1.0,
- *   architecture 1, flags/reserved zero. Tables start at 8-byte file offsets.
- * - Empty tables use count=0, offset=0. All metadata and region file bytes
- *   are bounded and nonoverlapping. Region alignment is a power of two,
- *   <= 1 GiB; the actual allocation has at least 4 KiB alignment.
- * - Every region has R, optional W or X, nonzero memory_size >= file_size.
- *   The entry must be inside file-backed bytes of an executable region.
- * - Relocations are sorted by (patch_region,patch_offset), do not overlap,
- *   and patch bytes entirely inside that region's memory_size.
- *   ABS64 writes base[target_region]+target_offset+addend.
- *   REL32/REL64 write that target minus (patch_address+4/+8), signed.
- *   IMPORT64 uses target_region as the import index, target_offset=0, and
- *   writes binding_address+addend. Symbols are NUL-terminated, 1..127 bytes
- *   of printable non-space ASCII within the string table; exports are unique.
- * - The loader accepts at most 64 regions, 4096 relocations, 64 imports,
- *   64 exports and 64 MiB of page-rounded regions. Reserve space for the
- *   32 KiB user stack within the address space's 64 MiB allocation budget.
- * - Entry receives zeroed GPRs except RSP. RSP is 8 modulo 16, with a zero
- *   return slot and 32 bytes of spare space above it. No arguments, TLS or
- *   C runtime are provided. Exit by syscall; returning jumps to address zero.
- * - Imports require explicit bindings to this process's own mapped user
- *   objects; there is no kernel-symbol import or automatic library search.
- */
+/* RIEF v1.0 uses little-endian fixed-size records and independent regions.
+ * User W^X is enforced; relocations are bounded, sorted and non-overlapping.
+ * Limits: 64 regions, 4096 relocations, 64 imports/exports, 64 MiB mapped budget.
+ * The budget includes a 128 KiB user stack and 64 KiB TLS block.
+ * FS points at TLS: self/PID/TID at 0/8/16; application TLS starts at 64. */
 #define RIEF_MAGIC 0x46454952u
 #define RIEF_ARCH_X86_64 1u
 #define RIEF_REGION_R (1u << 0)
@@ -348,9 +305,11 @@ typedef struct {
     INT32 exit_code;
     UINT64 fault_address, fault_ip;
     char name[32];
+    UINT32 parent, execution_class, cpu, reserved;
+    UINT8 uuid[16];
 } k_process_info;
-/* Load is transactional: no runnable task exists until every check/relocation
- * succeeds. Bindings must point into this process's existing user space. */
+/* Low-level process handles are caller-owned until destroy/reap.
+ * RIEF load is transactional; bindings must reference that process's user mappings. */
 k_process *k_process_create(const char *);
 int k_rief_load(k_process *, const void *, UINT64, const k_rief_binding *, UINT32);
 int k_rief_export(k_process *, const char *, UINT64 *);
@@ -360,28 +319,77 @@ int k_process_get(UINT32 index, k_process_info *);
 k_address_space *k_process_space(k_process *);
 UINT32 k_process_id(k_process *);
 
-/* SYSCALL and INT 0x80 share this ABI:
- * RAX=number; RDI,RSI,RDX,R10,R8,R9=args; RAX=result/negative K_E*.
- * SYSCALL clobbers RCX/R11 as defined by x86-64. No pointer reaches a
- * kernel driver without page-by-page validation and a bounded copy.
- * User ABI is freestanding x86-64; x87/SSE state is saved, AVX is disabled.
- * Arguments by call (in the register order above):
- * EXIT(code); WRITE(console fd=1/2 or writable file fd,ptr,len<=4096); YIELD();
- * SLEEP(ms<=86400000); GETPID(); TICKS(); SEND(target_task,ptr,len<=128); RECV(k_message
- * *,capacity>=sizeof(k_message)); OPEN(NUL-terminated absolute-or-named-root path,flags);
- * READ(fd,ptr,len<=4096); MKDIR(path); SYNC(). OPEN flags are K_OPEN_* below.
- * CREATE/TRUNC/APPEND/EXCL require WRITE; EXCL also requires CREATE. CREATE|EXCL never replaces a
- * file. File writes advance the descriptor offset; APPEND chooses EOF atomically. Persistent file
- * mutation is limited to 4 MiB per resulting file. CLOSE(fd). OPEN returns fd >= 3; READ advances
- * its offset and returns byte count (0 at EOF). RECV returns 0 or K_EAGAIN. User raw disk access is
- * denied. Each user process has one thread pinned to CPU 0; syscall pointers are checked over their
- * whole range before any externally visible operation. */
+/* Ring 1 and Ring 3 both run at CPL3/IOPL0.
+ * Authority comes from the launcher, never from executable contents.
+ * Processes have one thread and fixed CPU affinity. */
+#define K_EXEC_RING1 1u
+#define K_EXEC_RING3 3u
+#define K_CPU_AUTO 0xffffffffu
+#define K_MAX_PROCESSES 64u
+#define K_PROCESS_ARGS_MAX 1024u
+#define K_TLS_BYTES 65536u
+#define K_USER_CANON_LIMIT 0x0000800000000000ULL
+#define K_CTL_KILL 1u
+#define K_CTL_STOP 2u
+#define K_CTL_CONTINUE 3u
+#define K_WAIT_REAP 1u
+#define K_WAIT_NOHANG 2u
+#define K_ADMIN_MEM_READ 1u
+#define K_ADMIN_MEM_WRITE 2u
+#define K_ADMIN_MAP_AT 3u
+#define K_ADMIN_DISK_READ 4u
+#define K_ADMIN_PART_CLAIM 5u
+#define K_ADMIN_PART_READ 6u
+#define K_ADMIN_PART_WRITE 7u
+#define K_ADMIN_PART_RELEASE 8u
+#define K_ADMIN_INPUT_CLAIM 9u
+#define K_ADMIN_INPUT_READ 10u
+#define K_ADMIN_INPUT_RELEASE 11u
+/* UUIDs identify process instances; they are not bearer credentials. */
+typedef struct {
+    UINT8 uuid[16];
+    UINT32 pid, parent, execution_class, cpu;
+    UINT64 tls;
+    UINT64 reserved[3];
+} k_identity;
+_Static_assert(sizeof(k_identity) == 64, "identity ABI");
+typedef struct {
+    UINT32 version, size, operation, flags;
+    UINT8 caller_uuid[16], target_uuid[16];
+    UINT32 target_pid, resource;
+    UINT64 address, length, value, buffer;
+} k_admin_request;
+_Static_assert(sizeof(k_admin_request) == 88, "admin request ABI");
+/* Ring 1 requests are copied and validated before use.
+ * Remote memory access requires a stopped target; W^X and kernel mappings remain protected.
+ * Partition writes require an exclusive validated lease; failed writes quarantine it.
+ * Raw input can be leased to one helper and is released on process death. */
+int k_process_launch(const char *path, const char *arguments, UINT32 execution_class, UINT32 cpu,
+                     UINT32 parent, UINT32 *pid);
+int k_process_start_on(k_process *, UINT32 cpu, UINT32 *task_id);
+int k_process_query(UINT32 pid, k_process_info *);
+int k_process_control(UINT32 pid, UINT32 operation);
+int k_process_reap_pid(UINT32 pid, k_process_info *);
+int k_process_identity(UINT32 pid, k_identity *);
+int k_service_lookup(const char *name, UINT32 *task_id);
+BOOLEAN k_input_claimed(void);
+/* Partition IDs are stable for this boot. */
+typedef struct {
+    UINT32 id, disk, number, sector_size;
+    UINT64 start, sectors;
+    UINT32 read_only, mounted, owner_pid, failed;
+} k_partition_info;
+int k_partition_get(UINT32 index, k_partition_info *);
+
+/* SYSCALL/INT 0x80 ABI: RAX=number; RDI,RSI,RDX,R10,R8,R9=args; RAX=result.
+ * SYSCALL clobbers RCX/R11. User pointers are range-checked and copied.
+ * Processes have one thread with fixed selected/automatic CPU affinity. */
 #define K_OPEN_WRITE 1u
 #define K_OPEN_CREATE 2u
 #define K_OPEN_TRUNC 4u
 #define K_OPEN_APPEND 8u
 #define K_OPEN_EXCL 16u
-/* Flags=0 preserves the original read-only OPEN ABI. */
+/* flags=0 keeps OPEN read-only. */
 enum {
     K_SYS_EXIT = 0,
     K_SYS_WRITE = 1,
@@ -395,6 +403,22 @@ enum {
     K_SYS_READ = 9,
     K_SYS_CLOSE = 10,
     K_SYS_MKDIR = 11,
-    K_SYS_SYNC = 12
+    K_SYS_SYNC = 12,
+    K_SYS_SPAWN = 13,
+    K_SYS_PROCINFO = 14,
+    K_SYS_WAITPID = 15,
+    K_SYS_CONTROL = 16,
+    K_SYS_ADMIN = 17,
+    K_SYS_IDENTITY = 18,
+    K_SYS_SERVICE_REGISTER = 19,
+    K_SYS_SERVICE_LOOKUP = 20,
+    K_SYS_GETCPU = 21,
+    K_SYS_TLSBASE = 22,
+    K_SYS_GETARGS = 23,
+    K_SYS_SEEK = 24,
+    K_SYS_MAP = 25,
+    K_SYS_SERVICE_REPLY = 26,
+    K_SYS_DISKINFO = 27,
+    K_SYS_PARTITIONINFO = 28
 };
 #endif
