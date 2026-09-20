@@ -1043,11 +1043,10 @@ static void cmd_inputtest(void)
 
 static void cmd_cachetest(void)
 {
-    UINT64 p = pmm_alloc_page(), flags = 0, cr0;
-    __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
+    UINT64 p = pmm_alloc_page(), flags = 0;
     int e = p ? vmm_translate(kernel_get_pml4(), p, NULL, &flags) : K_ENOMEM;
     report("allocated RAM selects write-back PAT entry with CPU caches enabled",
-           !e && !(flags & (PAGE_PCD | PAGE_PWT)) && !(cr0 & ((1ULL << 30) | (1ULL << 29))));
+           !e && !(flags & (PAGE_PCD | PAGE_PWT)) && k_cpu_caches_enabled());
     if (p)
         pmm_free_page(p);
     report("console has RAM text buffer and no GPU readback", kernel_console_buffered());
@@ -1223,7 +1222,7 @@ static void hog_worker(void *arg)
     while (k_ticks() < live.end_tick && !live.stop && loops < 300000000ULL) {
         ++live.counters[i];
         ++loops;
-        __asm__ volatile("pause");
+        k_cpu_relax();
     }
     __atomic_add_fetch(&live.done, 1, __ATOMIC_RELEASE);
 }
@@ -2569,8 +2568,2182 @@ static void cmd_pmm(void)
     con_print_uint(kernel_pmm_used_mib());
     con_print("\n");
 }
+/* Network configuration and application protocols are OS policy. */
+static UINT16 os_be16(const void *p)
+{
+    const UINT8 *b = p;
+    return (UINT16)((b[0] << 8) | b[1]);
+}
+static UINT32 os_be32(const void *p)
+{
+    const UINT8 *b = p;
+    return ((UINT32)b[0] << 24) | ((UINT32)b[1] << 16) | ((UINT32)b[2] << 8) | b[3];
+}
+static void os_put16(void *p, UINT16 v)
+{
+    UINT8 *b = p;
+    b[0] = (UINT8)(v >> 8);
+    b[1] = (UINT8)v;
+}
+static void os_put32(void *p, UINT32 v)
+{
+    UINT8 *b = p;
+    b[0] = (UINT8)(v >> 24);
+    b[1] = (UINT8)(v >> 16);
+    b[2] = (UINT8)(v >> 8);
+    b[3] = (UINT8)v;
+}
+static BOOLEAN os_bytes_zero(const UINT8 *p, UINT32 n)
+{
+    while (n--)
+        if (*p++)
+            return FALSE;
+    return TRUE;
+}
+static void os_print_address(UINT32 family, const UINT8 *bytes)
+{
+    k_net_address a = {0};
+    a.family = family;
+    copy_(a.bytes, bytes, family == 4 ? 4 : 16);
+    char text[48];
+    if (!k_net_format(&a, text, sizeof(text)))
+        con_print(text);
+}
+static void cmd_net(void)
+{
+    for (UINT32 i = 0; i < k_net_count(); ++i) {
+        k_net_info d;
+        if (k_net_get(i, &d))
+            continue;
+        con_print_uint(i);
+        con_putc(' ');
+        con_print(d.name);
+        con_putc(' ');
+        con_print(d.driver);
+        con_print(" PCI ");
+        con_print_hex(d.vendor);
+        con_putc(':');
+        con_print_hex(d.device);
+        con_print((d.flags & K_NET_UP) ? " up" : " down");
+        con_print((d.flags & K_NET_LINK) ? " link" : " no-carrier");
+        con_print(" ");
+        con_print_uint(d.speed_mbps);
+        con_print(" Mb/s MAC ");
+        static const char hex[] = "0123456789abcdef";
+        for (UINT32 j = 0; j < 6; ++j) {
+            if (j)
+                con_putc(':');
+            con_putc(hex[d.mac[j] >> 4]);
+            con_putc(hex[d.mac[j] & 15]);
+        }
+        con_putc('\n');
+        if (d.error) {
+            error_("  driver", d.error);
+            continue;
+        }
+        con_print("  IPv4 ");
+        os_print_address(4, d.config.address);
+        con_print(" mask ");
+        os_print_address(4, d.config.mask);
+        con_print(" gateway ");
+        os_print_address(4, d.config.gateway);
+        con_print(" DNS ");
+        os_print_address(4, d.config.dns);
+        if (!(d.flags & K_NET_READY4))
+            con_print(" (unconfigured/tentative)");
+        con_putc('\n');
+        con_print("  IPv6 ");
+        os_print_address(6, d.link_local6);
+        con_print(" / ");
+        os_print_address(6, d.config.address6);
+        con_putc('/');
+        con_print_uint(d.config.prefix6);
+        con_print(" gateway ");
+        os_print_address(6, d.config.gateway6);
+        con_print(" DNS ");
+        os_print_address(6, d.config.dns6);
+        con_putc('\n');
+        con_print("  RX/TX ");
+        con_print_uint(d.rx_packets);
+        con_putc('/');
+        con_print_uint(d.tx_packets);
+        con_print(" dropped/errors ");
+        con_print_uint(d.dropped);
+        con_putc('/');
+        con_print_uint(d.errors);
+        con_print(" TCP retransmits ");
+        con_print_uint(d.tcp_retransmits);
+        con_putc('\n');
+        if (d.flags & K_NET_CONFLICT)
+            con_print("  duplicate address detected\n");
+    }
+}
+static int os_net_send_all(UINT32 h, const UINT8 *data, UINT32 length, UINT32 timeout)
+{
+    UINT64 start = k_uptime_ms();
+    UINT32 at = 0;
+    while (at < length) {
+        int n = k_net_send(h, data + at, length - at > 4096 ? 4096 : length - at, NULL);
+        if (n > 0) {
+            at += (UINT32)n;
+            continue;
+        }
+        if (n != K_EAGAIN)
+            return n ? n : K_EIO;
+        if (k_uptime_ms() - start >= timeout)
+            return K_ETIMEDOUT;
+        k_sleep(1);
+    }
+    return 0;
+}
+static int os_net_read_exact(UINT32 h, UINT8 *data, UINT32 length, UINT32 timeout)
+{
+    UINT64 start = k_uptime_ms();
+    UINT32 at = 0;
+    while (at < length) {
+        int n = k_net_receive(h, data + at, length - at, NULL);
+        if (n > 0) {
+            at += (UINT32)n;
+            continue;
+        }
+        if (!n)
+            return K_EIO;
+        if (n != K_EAGAIN)
+            return n;
+        if (k_uptime_ms() - start >= timeout)
+            return K_ETIMEDOUT;
+        k_sleep(1);
+    }
+    return 0;
+}
+static k_mutex os_dhcp_lock[K_NET_MAX_IF];
+static BOOLEAN os_dhcp_managed[K_NET_MAX_IF];
+static UINT64 os_dhcp_renew[K_NET_MAX_IF];
+
+typedef struct {
+    UINT8 message, address[4], mask[4], gateway[4], dns[4], server[4];
+    UINT32 lease, renew;
+} os_dhcp_offer;
+static os_dhcp_offer os_dhcp_lease[K_NET_MAX_IF];
+static UINT64 os_dhcp_expiry[K_NET_MAX_IF], os_dhcp_rebind[K_NET_MAX_IF];
+static int os_dhcp_parse(const UINT8 *p, UINT32 n, UINT32 xid, const UINT8 *mac, os_dhcp_offer *out)
+{
+    if (n < 240 || p[0] != 2 || p[1] != 1 || p[2] != 6 || os_be32(p + 4) != xid ||
+        !equal_(p + 28, mac, 6) || os_be32(p + 236) != 0x63825363)
+        return K_EAGAIN;
+    os_dhcp_offer o = {0};
+    copy_(o.address, p + 16, 4);
+    BOOLEAN end = FALSE, server = FALSE, mask = FALSE;
+    for (UINT32 at = 240; at < n;) {
+        UINT8 type = p[at++];
+        if (!type)
+            continue;
+        if (type == 255) {
+            end = TRUE;
+            break;
+        }
+        if (at >= n)
+            return K_EINVAL;
+        UINT32 len = p[at++];
+        if (len > n - at)
+            return K_EINVAL;
+        if (type == 53) {
+            if (len != 1 || o.message)
+                return K_EINVAL;
+            o.message = p[at];
+        }
+        if (type == 54) {
+            if (len != 4 || server)
+                return K_EINVAL;
+            server = TRUE;
+            copy_(o.server, p + at, 4);
+        }
+        if (type == 1) {
+            if (len != 4 || mask)
+                return K_EINVAL;
+            mask = TRUE;
+            copy_(o.mask, p + at, 4);
+        }
+        if (type == 3) {
+            if (!len || (len % 4))
+                return K_EINVAL;
+            copy_(o.gateway, p + at, 4);
+        }
+        if (type == 6) {
+            if (!len || (len % 4))
+                return K_EINVAL;
+            copy_(o.dns, p + at, 4);
+        }
+        if (type == 51) {
+            if (len != 4)
+                return K_EINVAL;
+            o.lease = os_be32(p + at);
+        }
+        if (type == 58) {
+            if (len != 4)
+                return K_EINVAL;
+            o.renew = os_be32(p + at);
+        }
+        if (type == 52)
+            return K_ENOTSUP;
+        at += len;
+    }
+    if (!end || !o.message || !server)
+        return K_EINVAL;
+    *out = o;
+    return 0;
+}
+static UINT32 os_dhcp_packet(UINT8 p[576], UINT32 xid, const UINT8 *mac, UINT8 type,
+                             const os_dhcp_offer *offer)
+{
+    zero_(p, 576);
+    p[0] = 1;
+    p[1] = 1;
+    p[2] = 6;
+    os_put32(p + 4, xid);
+    os_put16(p + 10, 0x8000);
+    copy_(p + 28, mac, 6);
+    os_put32(p + 236, 0x63825363);
+    UINT32 at = 240;
+    p[at++] = 53;
+    p[at++] = 1;
+    p[at++] = type;
+    p[at++] = 61;
+    p[at++] = 7;
+    p[at++] = 1;
+    copy_(p + at, mac, 6);
+    at += 6;
+    if (offer) {
+        p[at++] = 50;
+        p[at++] = 4;
+        copy_(p + at, offer->address, 4);
+        at += 4;
+        p[at++] = 54;
+        p[at++] = 4;
+        copy_(p + at, offer->server, 4);
+        at += 4;
+    }
+    p[at++] = 55;
+    p[at++] = 6;
+    p[at++] = 1;
+    p[at++] = 3;
+    p[at++] = 6;
+    p[at++] = 51;
+    p[at++] = 58;
+    p[at++] = 59;
+    p[at++] = 57;
+    p[at++] = 2;
+    os_put16(p + at, 1472);
+    at += 2;
+    p[at++] = 255;
+    return at < 300 ? 300 : at;
+}
+static int os_dhcp_acquire(UINT32 id, BOOLEAN managed)
+{
+    if (!id || id >= k_net_count())
+        return K_EINVAL;
+    int e = k_mutex_lock(&os_dhcp_lock[id]);
+    if (e)
+        return e;
+    if (!managed && !os_dhcp_managed[id]) {
+        k_mutex_unlock(&os_dhcp_lock[id]);
+        return K_ECANCELED;
+    }
+    k_net_info info;
+    e = k_net_get(id, &info);
+    UINT32 sock = 0;
+    if (e || info.error) {
+        if (!e)
+            e = info.error;
+        goto done;
+    }
+    BOOLEAN renewing = (info.flags & K_NET_READY4) && os_dhcp_expiry[id] > k_uptime_ms() &&
+                       equal_(info.config.address, os_dhcp_lease[id].address, 4);
+    k_net_config config = info.config;
+    if (!renewing && (info.flags & K_NET_READY4)) {
+        zero_(config.address, 16);
+        config.lease_seconds = 0;
+        e = k_net_configure(&config);
+        if (e)
+            goto done;
+    }
+    config.flags |= K_NET_UP | K_NET_AUTO6;
+    if (!(info.flags & K_NET_UP))
+        e = k_net_configure(&config);
+    if (e)
+        goto done;
+    UINT64 link_start = k_uptime_ms();
+    do {
+        e = k_net_get(id, &info);
+        if (e)
+            goto done;
+        if (info.flags & K_NET_LINK)
+            break;
+        k_sleep(10);
+    } while (k_uptime_ms() - link_start < 5000);
+    if (!(info.flags & K_NET_LINK)) {
+        e = K_ENETDOWN;
+        goto done;
+    }
+    e = k_net_socket(4, K_SOCK_UDP, &sock);
+    if (e)
+        goto done;
+    k_net_address bind = {0};
+    bind.family = 4;
+    bind.interface = id;
+    bind.port = 68;
+    e = k_net_bind(sock, &bind);
+    if (e)
+        goto done;
+    k_net_address server = {0};
+    server.family = 4;
+    server.interface = id;
+    server.port = 67;
+    for (UINT32 i = 0; i < 4; ++i)
+        server.bytes[i] = 255;
+    UINT32 xid = k_net_nonce() ^ (UINT32)k_ticks() ^ (UINT32)((UINT64)info.mac[4] << 24) ^
+                 ((UINT32)info.mac[5] << 16);
+    UINT8 tx[576], rx[1472];
+    os_dhcp_offer chosen = {0}, ack = {0};
+    UINT32 state = renewing ? (k_uptime_ms() >= os_dhcp_rebind[id] ? 5 : 4) : 1;
+    if (renewing)
+        chosen = os_dhcp_lease[id];
+    UINT64 start = k_uptime_ms(), next = 0;
+    while (k_uptime_ms() - start < 20000) {
+        UINT64 now = k_uptime_ms();
+        if (state >= 4 && now >= os_dhcp_expiry[id]) {
+            e = K_ENETDOWN;
+            goto done;
+        }
+        if (state == 4 && now >= os_dhcp_rebind[id]) {
+            state = 5;
+            next = 0;
+        }
+        if (now >= next) {
+            UINT32 length =
+                os_dhcp_packet(tx, xid, info.mac, state == 1 ? 1 : 3, state == 2 ? &chosen : NULL);
+            if (state >= 4)
+                copy_(tx + 12, chosen.address, 4);
+            if (state == 4) {
+                os_put16(tx + 10, 0);
+                copy_(server.bytes, chosen.server, 4);
+            } else
+                for (UINT32 i = 0; i < 4; ++i)
+                    server.bytes[i] = 255;
+            int sent = k_net_send(sock, tx, length, &server);
+            if (sent < 0 && sent != K_EAGAIN) {
+                e = sent;
+                goto done;
+            }
+            if (sent >= 0)
+                next = now + 2000;
+        }
+        k_net_address from;
+        int n = k_net_receive(sock, rx, sizeof(rx), &from);
+        if (n >= 0 && from.port == 67 && from.interface == id) {
+            os_dhcp_offer offer;
+            int parsed = os_dhcp_parse(rx, (UINT32)n, xid, info.mac, &offer);
+            if (!parsed) {
+                if (state == 1 && offer.message == 2 && !os_bytes_zero(offer.address, 4)) {
+                    chosen = offer;
+                    state = 2;
+                    next = 0;
+                } else if ((state == 2 || state >= 4) &&
+                           (state == 5 || equal_(offer.server, chosen.server, 4)) &&
+                           offer.message == 6) {
+                    zero_(config.address, 16);
+                    config.lease_seconds = 0;
+                    (void)k_net_configure(&config);
+                    os_dhcp_expiry[id] = 0;
+                    e = K_EPERM;
+                    goto done;
+                } else if ((state == 2 || state >= 4) &&
+                           (state == 5 || equal_(offer.server, chosen.server, 4)) &&
+                           offer.message == 5 &&
+                           (equal_(offer.address, chosen.address, 4) ||
+                            (state >= 4 && os_bytes_zero(offer.address, 4)))) {
+                    ack = offer;
+                    if (os_bytes_zero(ack.address, 4))
+                        copy_(ack.address, chosen.address, 4);
+                    if (state >= 4 && os_bytes_zero(ack.mask, 4))
+                        copy_(ack.mask, chosen.mask, 4);
+                    state = 3;
+                    break;
+                }
+            }
+        } else if (n < 0 && n != K_EAGAIN) {
+            e = n;
+            goto done;
+        }
+        k_sleep(1);
+    }
+    if (state != 3) {
+        e = K_ETIMEDOUT;
+        goto done;
+    }
+    if (os_bytes_zero(ack.mask, 4) || ack.lease < 10) {
+        e = K_EINVAL;
+        goto done;
+    }
+    e = k_net_get(id, &info);
+    if (e)
+        goto done;
+    config = info.config;
+    config.flags |= K_NET_UP | K_NET_AUTO6;
+    UINT64 accepted_at = k_uptime_ms();
+    copy_(config.address, ack.address, 4);
+    copy_(config.mask, ack.mask, 4);
+    copy_(config.gateway, ack.gateway, 4);
+    copy_(config.dns, ack.dns, 4);
+    config.lease_seconds = ack.lease > 604800 ? 604800 : ack.lease;
+    e = k_net_configure(&config);
+    if (e)
+        goto done;
+    start = k_uptime_ms();
+    while (k_uptime_ms() - start < 5000) {
+        e = k_net_get(id, &info);
+        if (e)
+            goto done;
+        if (info.flags & K_NET_CONFLICT) {
+            UINT32 length = os_dhcp_packet(tx, xid, info.mac, 4, &ack);
+            (void)k_net_send(sock, tx, length, &server);
+            e = K_EADDRINUSE;
+            goto done;
+        }
+        if (info.flags & K_NET_READY4)
+            break;
+        k_sleep(1);
+    }
+    if (!(info.flags & K_NET_READY4)) {
+        e = K_ETIMEDOUT;
+        goto done;
+    }
+    UINT32 renew = ack.renew;
+    if (!renew || renew >= config.lease_seconds)
+        renew = config.lease_seconds / 2;
+    os_dhcp_lease[id] = ack;
+    os_dhcp_expiry[id] = accepted_at + (UINT64)config.lease_seconds * 1000;
+    os_dhcp_rebind[id] = accepted_at + (UINT64)config.lease_seconds * 875;
+    os_dhcp_managed[id] = TRUE;
+    os_dhcp_renew[id] = accepted_at + (UINT64)renew * 1000;
+    e = 0;
+done:
+    if (sock)
+        (void)k_net_close(sock);
+    k_mutex_unlock(&os_dhcp_lock[id]);
+    return e;
+}
+static void os_dhcp_worker(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        for (UINT32 i = 1; i < k_net_count(); ++i) {
+            BOOLEAN renew = FALSE;
+            if (!k_mutex_trylock(&os_dhcp_lock[i])) {
+                renew = os_dhcp_managed[i] && k_uptime_ms() >= os_dhcp_renew[i];
+                k_mutex_unlock(&os_dhcp_lock[i]);
+            }
+            if (renew) {
+                int e = os_dhcp_acquire(i, FALSE);
+                if (e && !k_mutex_lock(&os_dhcp_lock[i])) {
+                    os_dhcp_renew[i] = k_uptime_ms() + 10000;
+                    k_mutex_unlock(&os_dhcp_lock[i]);
+                }
+            }
+        }
+        k_sleep(1000);
+    }
+}
+static void cmd_dhcp(const char *args)
+{
+    UINT64 id;
+    if (!number_(&args, &id) || *args || id >= K_NET_MAX_IF) {
+        con_print("dhcp <interface number>\n");
+        return;
+    }
+    con_print("DHCP: waiting for link and lease...\n");
+    int e = os_dhcp_acquire((UINT32)id, TRUE);
+    if (e)
+        error_("dhcp", e);
+    else
+        cmd_net();
+}
+static void cmd_netup(const char *args, BOOLEAN up)
+{
+    UINT64 id;
+    if (!number_(&args, &id) || *args || !id || id >= K_NET_MAX_IF) {
+        con_print("netup/netdown <interface number>\n");
+        return;
+    }
+    int e = k_mutex_lock(&os_dhcp_lock[id]);
+    if (!e) {
+        k_net_info info;
+        e = k_net_get((UINT32)id, &info);
+        if (!e) {
+            if (up)
+                info.config.flags |= K_NET_UP | K_NET_AUTO6;
+            else {
+                info.config.flags = 0;
+                os_dhcp_managed[id] = FALSE;
+            }
+            e = k_net_configure(&info.config);
+        }
+        k_mutex_unlock(&os_dhcp_lock[id]);
+    }
+    if (e)
+        error_("network", e);
+    else
+        cmd_net();
+}
+static void cmd_ip(const char *args, BOOLEAN six)
+{
+    UINT64 id;
+    char text[K_PATH_MAX];
+    if (!number_(&args, &id) || !id || id >= K_NET_MAX_IF) {
+        con_print(
+            "ip <if> <address> <mask> <gateway> [dns] | ip6 <if> <address/prefix> [gateway]\n");
+        return;
+    }
+    k_net_info info;
+    int e = k_net_get((UINT32)id, &info);
+    if (e) {
+        error_("ip", e);
+        return;
+    }
+    k_net_config c = info.config;
+    c.flags |= K_NET_UP;
+    c.lease_seconds = 0;
+    k_net_address a;
+    if (!six) {
+        UINT8 *fields[] = {c.address, c.mask, c.gateway, c.dns};
+        for (UINT32 i = 0; i < 4; ++i) {
+            if (!path_argument(&args, text)) {
+                if (i == 3)
+                    break;
+                e = K_EINVAL;
+                break;
+            }
+            e = k_net_parse(text, 4, &a);
+            if (e)
+                break;
+            copy_(fields[i], a.bytes, 4);
+        }
+    } else {
+        if (!path_argument(&args, text))
+            e = K_EINVAL;
+        else {
+            UINT32 pos = 0;
+            while (text[pos] && text[pos] != '/')
+                ++pos;
+            if (!text[pos])
+                e = K_EINVAL;
+            else {
+                text[pos++] = 0;
+                const char *bits = text + pos;
+                UINT64 prefix;
+                if (!number_(&bits, &prefix) || *bits || prefix > 128)
+                    e = K_EINVAL;
+                else {
+                    e = k_net_parse(text, 6, &a);
+                    if (!e) {
+                        copy_(c.address6, a.bytes, 16);
+                        c.prefix6 = (UINT32)prefix;
+                        c.flags &= ~K_NET_AUTO6;
+                    }
+                }
+            }
+            if (!e && path_argument(&args, text)) {
+                e = k_net_parse(text, 6, &a);
+                if (!e)
+                    copy_(c.gateway6, a.bytes, 16);
+            }
+        }
+    }
+    while (*args == ' ')
+        ++args;
+    if (!e && *args)
+        e = K_EINVAL;
+    if (!e) {
+        e = k_mutex_lock(&os_dhcp_lock[id]);
+        if (!e) {
+            os_dhcp_managed[id] = FALSE;
+            e = k_net_configure(&c);
+            k_mutex_unlock(&os_dhcp_lock[id]);
+        }
+    }
+    if (e)
+        error_("ip", e);
+    else
+        con_print("Address configured; duplicate-address probes run before activation.\n");
+}
+static int os_dns_name(const UINT8 *p, UINT32 n, UINT32 *position, char out[256])
+{
+    UINT32 at = *position, used = 0, jumps = 0;
+    BOOLEAN jumped = FALSE;
+    while (at < n) {
+        UINT8 len = p[at++];
+        if (!len) {
+            if (!jumped)
+                *position = at;
+            out[used] = 0;
+            return 0;
+        }
+        if ((len & 0xc0) == 0xc0) {
+            if (at >= n || ++jumps > 32)
+                return K_EINVAL;
+            UINT32 target = ((UINT32)(len & 63) << 8) | p[at++];
+            if (target >= at - 2)
+                return K_EINVAL;
+            if (!jumped)
+                *position = at;
+            jumped = TRUE;
+            at = target;
+            continue;
+        }
+        if ((len & 0xc0) || len > n - at || used + (used ? 1 : 0) + len > 253)
+            return K_EINVAL;
+        if (used)
+            out[used++] = '.';
+        for (UINT32 i = 0; i < len; ++i) {
+            UINT8 c = p[at++];
+            if (c < 33 || c > 126 || c == '.')
+                return K_EINVAL;
+            out[used++] = (char)(c >= 'A' && c <= 'Z' ? c + 32 : c);
+        }
+    }
+    return K_EINVAL;
+}
+static int os_dns_query_depth(const char *hostname, UINT32 family, UINT32 interface,
+                              k_net_address *result, UINT32 depth)
+{
+    if (depth > 4)
+        return K_E2BIG;
+    if (family != 4 && family != 6)
+        return K_EINVAL;
+    k_net_info chosen;
+    BOOLEAN found = FALSE;
+    UINT32 transport = 4;
+    for (UINT32 i = 1; i < k_net_count(); ++i) {
+        if (interface != K_NET_ANY_IF && interface != i)
+            continue;
+        k_net_info info;
+        if (k_net_get(i, &info))
+            continue;
+        if ((info.flags & K_NET_READY4) && !os_bytes_zero(info.config.dns, 4))
+            transport = 4;
+        else if ((info.flags & K_NET_READY6) && !os_bytes_zero(info.config.dns6, 16))
+            transport = 6;
+        else
+            continue;
+        chosen = info;
+        found = TRUE;
+        break;
+    }
+    if (!found)
+        return K_ENETUNREACH;
+    char host[256];
+    UINT32 length = (UINT32)strlen_(hostname);
+    if (length && hostname[length - 1] == '.')
+        --length;
+    if (!length || length > 253)
+        return K_EINVAL;
+    for (UINT32 i = 0; i < length; ++i)
+        host[i] =
+            (hostname[i] >= 'A' && hostname[i] <= 'Z') ? (char)(hostname[i] + 32) : hostname[i];
+    host[length] = 0;
+    UINT8 query[512] = {0}, response[4096];
+    UINT16 xid = (UINT16)(k_ticks() ^ k_task_id() ^ (k_net_nonce()));
+    os_put16(query, xid);
+    os_put16(query + 2, 0x100);
+    os_put16(query + 4, 1);
+    UINT32 qn = 12, at = 0;
+    while (at < length) {
+        UINT32 begin = at;
+        while (at < length && host[at] != '.')
+            ++at;
+        UINT32 n = at - begin;
+        if (!n || n > 63 || qn + n + 6 > sizeof(query))
+            return K_EINVAL;
+        query[qn++] = (UINT8)n;
+        for (UINT32 i = begin; i < at; ++i) {
+            if ((UINT8)host[i] < 33 || (UINT8)host[i] > 126)
+                return K_EINVAL;
+            query[qn++] = (UINT8)host[i];
+        }
+        if (at < length)
+            ++at;
+    }
+    query[qn++] = 0;
+    os_put16(query + qn, family == 4 ? 1 : 28);
+    qn += 2;
+    os_put16(query + qn, 1);
+    qn += 2;
+    k_net_address server = {0};
+    server.family = transport;
+    server.interface = chosen.id;
+    server.port = 53;
+    copy_(server.bytes, transport == 4 ? chosen.config.dns : chosen.config.dns6,
+          transport == 4 ? 4 : 16);
+    UINT32 sock;
+    int e = k_net_socket(transport, K_SOCK_UDP, &sock);
+    if (e)
+        return e;
+    e = k_net_connect(sock, &server, 0);
+    if (e) {
+        k_net_close(sock);
+        return e;
+    }
+    UINT64 start = k_uptime_ms(), next = 0;
+    int size = K_ETIMEDOUT;
+    while (k_uptime_ms() - start < 6000) {
+        UINT64 now = k_uptime_ms();
+        if (now >= next) {
+            int sent = k_net_send(sock, query, qn, NULL);
+            if (sent < 0 && sent != K_EAGAIN) {
+                size = sent;
+                break;
+            }
+            if (sent >= 0)
+                next = now + 2000;
+        }
+        k_net_address from;
+        int n = k_net_receive(sock, response, sizeof(response), &from);
+        if (n >= 12 && os_be16(response) == xid) {
+            size = n;
+            break;
+        }
+        if (n < 0 && n != K_EAGAIN) {
+            size = n;
+            break;
+        }
+        k_sleep(1);
+    }
+    k_net_close(sock);
+    if (size < 0)
+        return size;
+    if (os_be16(response + 2) & 0x200) {
+        e = k_net_socket(transport, K_SOCK_TCP, &sock);
+        if (e)
+            return e;
+        e = k_net_connect(sock, &server, 8000);
+        UINT8 prefix[2];
+        os_put16(prefix, (UINT16)qn);
+        if (!e)
+            e = os_net_send_all(sock, prefix, 2, 8000);
+        if (!e)
+            e = os_net_send_all(sock, query, qn, 8000);
+        if (!e)
+            e = os_net_read_exact(sock, prefix, 2, 8000);
+        if (!e) {
+            size = os_be16(prefix);
+            if (size < 12 || size > (int)sizeof(response))
+                e = K_E2BIG;
+        }
+        if (!e)
+            e = os_net_read_exact(sock, response, (UINT32)size, 8000);
+        k_net_close(sock);
+        if (e)
+            return e;
+    }
+    UINT32 flags = os_be16(response + 2);
+    if (os_be16(response) != xid || !(flags & 0x8000) || (flags & 0x7800) || (flags & 0x200) ||
+        os_be16(response + 4) != 1)
+        return K_EIO;
+    if (flags & 15)
+        return (flags & 15) == 3 ? K_ENOENT : K_EIO;
+    UINT32 pos = 12;
+    char name[256];
+    e = os_dns_name(response, (UINT32)size, &pos, name);
+    if (e || !streq_(host, name) || pos + 4 > (UINT32)size ||
+        os_be16(response + pos) != (family == 4 ? 1 : 28) || os_be16(response + pos + 2) != 1)
+        return K_EIO;
+    pos += 4;
+    UINT32 first = pos, answers = os_be16(response + 6);
+    if (answers > 128)
+        return K_E2BIG;
+    for (UINT32 alias = 0; alias < 8; ++alias) {
+        pos = first;
+        BOOLEAN changed = FALSE;
+        for (UINT32 i = 0; i < answers; ++i) {
+            e = os_dns_name(response, (UINT32)size, &pos, name);
+            if (e || pos + 10 > (UINT32)size)
+                return K_EIO;
+            UINT32 type = os_be16(response + pos), cls = os_be16(response + pos + 2),
+                   n = os_be16(response + pos + 8);
+            pos += 10;
+            if (n > (UINT32)size - pos)
+                return K_EIO;
+            if (cls == 1 && streq_(name, host)) {
+                if (type == (family == 4 ? 1u : 28u) && n == (family == 4 ? 4u : 16u)) {
+                    zero_(result, sizeof(*result));
+                    result->family = family;
+                    result->interface = chosen.id;
+                    copy_(result->bytes, response + pos, n);
+                    return 0;
+                }
+                if (type == 5) {
+                    UINT32 target = pos;
+                    e = os_dns_name(response, (UINT32)size, &target, name);
+                    if (e || target != pos + n)
+                        return K_EIO;
+                    textcopy_(host, name, sizeof(host));
+                    changed = TRUE;
+                }
+            }
+            pos += n;
+        }
+        if (!changed)
+            break;
+    }
+    char original[256];
+    UINT32 olen = (UINT32)strlen_(hostname);
+    if (olen && hostname[olen - 1] == '.')
+        --olen;
+    for (UINT32 i = 0; i < olen; ++i)
+        original[i] =
+            hostname[i] >= 'A' && hostname[i] <= 'Z' ? (char)(hostname[i] + 32) : hostname[i];
+    original[olen] = 0;
+    if (!streq_(host, original))
+        return os_dns_query_depth(host, family, interface, result, depth + 1);
+    return K_ENOENT;
+}
+static int os_dns_query(const char *name, UINT32 family, UINT32 interface, k_net_address *out)
+{
+    return os_dns_query_depth(name, family, interface, out, 0);
+}
+static int os_resolve(const char *host, UINT32 interface, k_net_address *out)
+{
+    int e = k_net_parse(host, 4, out);
+    if (e)
+        e = k_net_parse(host, 6, out);
+    if (!e) {
+        out->interface = interface;
+        return 0;
+    }
+    if (streq_(host, "localhost")) {
+        e = k_net_parse("127.0.0.1", 4, out);
+        out->interface = 0;
+        return e;
+    }
+    e = os_dns_query(host, 4, interface, out);
+    if (e == K_ENOENT)
+        e = os_dns_query(host, 6, interface, out);
+    return e;
+}
+static void cmd_dns(const char *args)
+{
+    char host[K_PATH_MAX];
+    if (!path_argument(&args, host) || *args) {
+        con_print("dns <hostname>\n");
+        return;
+    }
+    k_net_address a;
+    int e = os_resolve(host, K_NET_ANY_IF, &a);
+    if (e)
+        error_("dns", e);
+    else {
+        os_print_address(a.family, a.bytes);
+        con_putc('\n');
+    }
+}
+static void cmd_ping(const char *args)
+{
+    char host[K_PATH_MAX];
+    UINT64 interface = K_NET_ANY_IF;
+    if (!path_argument(&args, host) || (*args && !number_(&args, &interface)) || *args ||
+        interface > 0xffffffffu) {
+        con_print("ping <address/host> [interface number]\n");
+        return;
+    }
+    k_net_address a;
+    int e = os_resolve(host, (UINT32)interface, &a);
+    if (e) {
+        error_("ping", e);
+        return;
+    }
+    for (UINT32 i = 0; i < 4; ++i) {
+        UINT32 ms;
+        e = k_net_ping(&a, 3000, &ms);
+        if (e)
+            error_("ping", e);
+        else {
+            con_print("reply from ");
+            os_print_address(a.family, a.bytes);
+            con_print(" time=");
+            con_print_uint(ms);
+            con_print(" ms\n");
+        }
+        if (i != 3)
+            k_sleep(200);
+    }
+}
+typedef struct {
+    UINT32 socket, head, count;
+    UINT64 started, last;
+    UINT8 bytes[4096];
+} os_http_reader;
+static int os_http_byte(os_http_reader *r)
+{
+    if (k_uptime_ms() - r->started >= 60000)
+        return K_ETIMEDOUT;
+    while (!r->count) {
+        int n = k_net_receive(r->socket, r->bytes, sizeof(r->bytes), NULL);
+        if (n > 0) {
+            r->head = 0;
+            r->count = (UINT32)n;
+            r->last = k_uptime_ms();
+            break;
+        }
+        if (!n)
+            return K_ENOENT;
+        if (n != K_EAGAIN)
+            return n;
+        UINT64 now = k_uptime_ms();
+        if (now - r->last >= 15000 || now - r->started >= 60000)
+            return K_ETIMEDOUT;
+        k_sleep(1);
+    }
+    --r->count;
+    return r->bytes[r->head++];
+}
+static int os_http_line(os_http_reader *r, char *line, UINT32 capacity, UINT32 *budget)
+{
+    UINT32 n = 0;
+    for (;;) {
+        int c = os_http_byte(r);
+        if (c < 0)
+            return c;
+        if (!*budget)
+            return K_E2BIG;
+        --*budget;
+        if (c == '\r') {
+            c = os_http_byte(r);
+            if (c < 0)
+                return c;
+            if (!*budget)
+                return K_E2BIG;
+            --*budget;
+            if (c != '\n')
+                return K_EIO;
+            line[n] = 0;
+            return 0;
+        }
+        if (c == '\n' || (!c) || (c < 32 && c != '\t'))
+            return K_EIO;
+        if (n + 1 >= capacity)
+            return K_E2BIG;
+        line[n++] = (char)c;
+    }
+}
+static BOOLEAN os_http_equal(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char x = *a++, y = *b++;
+        if (x >= 'A' && x <= 'Z')
+            x += 32;
+        if (y >= 'A' && y <= 'Z')
+            y += 32;
+        if (x != y)
+            return FALSE;
+    }
+    return *a == *b;
+}
+static int os_http_decimal(const char *s, UINT32 *out)
+{
+    if (*s < '0' || *s > '9')
+        return K_EINVAL;
+    UINT32 v = 0;
+    while (*s >= '0' && *s <= '9') {
+        if (v > (4194304u - (UINT32)(*s - '0')) / 10)
+            return K_E2BIG;
+        v = v * 10 + (UINT32)(*s++ - '0');
+    }
+    while (*s == ' ' || *s == '\t')
+        ++s;
+    if (*s)
+        return K_EINVAL;
+    *out = v;
+    return 0;
+}
+typedef struct {
+    char host[256], authority[272], path[1024];
+    UINT16 port;
+} os_http_url;
+static int os_http_url_parse(const char *url, os_http_url *out)
+{
+    if (!starts_with_(url, "http://"))
+        return K_ENOTSUP;
+    url += 7;
+    zero_(out, sizeof(*out));
+    out->port = 80;
+    UINT32 n = 0;
+    while (url[n] && url[n] != '/' && url[n] != '?' && url[n] != '#') {
+        if (n + 1 >= sizeof(out->authority) || (UINT8)url[n] <= 32 || (UINT8)url[n] >= 127 ||
+            url[n] == '@' || url[n] == '\\')
+            return K_EINVAL;
+        ++n;
+    }
+    if (!n)
+        return K_EINVAL;
+    copy_(out->authority, url, n);
+    const char *port = NULL;
+    if (url[0] == '[') {
+        UINT32 end = 1;
+        while (end < n && url[end] != ']')
+            ++end;
+        if (end == n || end - 1 >= sizeof(out->host))
+            return K_EINVAL;
+        copy_(out->host, url + 1, end - 1);
+        if (end + 1 < n) {
+            if (url[end + 1] != ':')
+                return K_EINVAL;
+            port = out->authority + end + 2;
+        }
+    } else {
+        UINT32 end = 0;
+        while (end < n && url[end] != ':')
+            ++end;
+        if (!end || end >= sizeof(out->host))
+            return K_EINVAL;
+        copy_(out->host, url, end);
+        if (end < n)
+            port = out->authority + end + 1;
+    }
+    if (port) {
+        UINT32 p = 0;
+        if (!*port)
+            return K_EINVAL;
+        while (*port) {
+            if (*port < '0' || *port > '9' || p > 6553)
+                return K_EINVAL;
+            p = p * 10 + (UINT32)(*port++ - '0');
+        }
+        if (!p || p > 65535)
+            return K_EINVAL;
+        out->port = (UINT16)p;
+    }
+    url += n;
+    UINT32 at = 0;
+    if (*url != '/')
+        out->path[at++] = '/';
+    while (*url && *url != '#') {
+        if (at + 1 >= sizeof(out->path) || (UINT8)*url <= 32 || (UINT8)*url >= 127 || *url == '\\')
+            return K_EINVAL;
+        out->path[at++] = *url++;
+    }
+    return 0;
+}
+/* HTTP only. Buffer the response before an explicit file write. */
+static int os_http_get(const char *url, UINT8 *body, UINT32 capacity, UINT32 *size, UINT32 *status,
+                       char redirect[1024])
+{
+    os_http_url u;
+    int e = os_http_url_parse(url, &u);
+    if (e)
+        return e;
+    k_net_address peer;
+    e = os_resolve(u.host, K_NET_ANY_IF, &peer);
+    if (e)
+        return e;
+    peer.port = u.port;
+    UINT32 h;
+    e = k_net_socket(peer.family, K_SOCK_TCP, &h);
+    if (e)
+        return e;
+    e = k_net_connect(h, &peer, 15000);
+    if (e) {
+        k_net_close(h);
+        return e;
+    }
+    char request[1600];
+    UINT32 at = 0;
+    const char *parts[] = {"GET ", u.path, " HTTP/1.1\r\nHost: ", u.authority,
+                           "\r\nUser-Agent: mini-os\r\nAccept: */*\r\nAccept-Encoding: "
+                           "identity\r\nConnection: close\r\n\r\n"};
+    for (UINT32 i = 0; i < 5; ++i) {
+        UINT32 n = (UINT32)strlen_(parts[i]);
+        if (n >= sizeof(request) - at) {
+            e = K_E2BIG;
+            goto done;
+        }
+        copy_(request + at, parts[i], n);
+        at += n;
+    }
+    e = os_net_send_all(h, (const UINT8 *)request, at, 15000);
+    if (e)
+        goto done;
+    os_http_reader r = {0};
+    r.socket = h;
+    r.started = r.last = k_uptime_ms();
+    char line[2048];
+    UINT32 budget = 16384, length = 0, interim = 0;
+    BOOLEAN has_length = FALSE, chunked = FALSE, encoding = FALSE;
+headers:
+    e = os_http_line(&r, line, sizeof(line), &budget);
+    if (e)
+        goto done;
+    if (strlen_(line) < 12 ||
+        (!starts_with_(line, "HTTP/1.1 ") && !starts_with_(line, "HTTP/1.0 ")) || line[9] < '1' ||
+        line[9] > '5' || line[10] < '0' || line[10] > '9' || line[11] < '0' || line[11] > '9' ||
+        (line[12] && line[12] != ' ')) {
+        e = K_EIO;
+        goto done;
+    }
+    *status =
+        (UINT32)(line[9] - '0') * 100 + (UINT32)(line[10] - '0') * 10 + (UINT32)(line[11] - '0');
+    redirect[0] = 0;
+    for (;;) {
+        e = os_http_line(&r, line, sizeof(line), &budget);
+        if (e)
+            goto done;
+        if (!line[0])
+            break;
+        UINT32 pos = 0;
+        while (line[pos] && line[pos] != ':') {
+            if (line[pos] <= 32 || line[pos] >= 127) {
+                e = K_EIO;
+                goto done;
+            }
+            ++pos;
+        }
+        if (!pos || !line[pos]) {
+            e = K_EIO;
+            goto done;
+        }
+        line[pos++] = 0;
+        while (line[pos] == ' ' || line[pos] == '\t')
+            ++pos;
+        char *value = line + pos;
+        UINT32 end = (UINT32)strlen_(value);
+        while (end && (value[end - 1] == ' ' || value[end - 1] == '\t'))
+            value[--end] = 0;
+        if (os_http_equal(line, "Content-Length")) {
+            UINT32 v;
+            e = os_http_decimal(value, &v);
+            if (e)
+                goto done;
+            if (has_length && v != length) {
+                e = K_EIO;
+                goto done;
+            }
+            has_length = TRUE;
+            length = v;
+        } else if (os_http_equal(line, "Transfer-Encoding")) {
+            if (chunked || !os_http_equal(value, "chunked")) {
+                e = K_ENOTSUP;
+                goto done;
+            }
+            chunked = TRUE;
+        } else if (os_http_equal(line, "Content-Encoding")) {
+            if (encoding || !os_http_equal(value, "identity")) {
+                e = K_ENOTSUP;
+                goto done;
+            }
+            encoding = TRUE;
+        } else if (os_http_equal(line, "Location")) {
+            if (redirect[0] || strlen_(value) >= 1024) {
+                e = K_E2BIG;
+                goto done;
+            }
+            textcopy_(redirect, value, 1024);
+        }
+    }
+    if (has_length && chunked) {
+        e = K_EIO;
+        goto done;
+    }
+    if (*status >= 100 && *status < 200) {
+        if (*status == 101 || ++interim > 4) {
+            e = K_ENOTSUP;
+            goto done;
+        }
+        has_length = chunked = encoding = FALSE;
+        length = 0;
+        goto headers;
+    }
+    if (*status >= 300 && *status < 400) {
+        e = redirect[0] ? K_EAGAIN : K_EIO;
+        goto done;
+    }
+    if (*status < 200 || *status >= 300) {
+        e = K_EIO;
+        goto done;
+    }
+    *size = 0;
+    if (*status == 204) {
+        if (chunked || (has_length && length)) {
+            e = K_EIO;
+            goto done;
+        }
+        e = 0;
+        goto done;
+    }
+    if (has_length && length > capacity) {
+        e = K_E2BIG;
+        goto done;
+    }
+    if (chunked) {
+        for (;;) {
+            UINT32 chunk_budget = 256;
+            e = os_http_line(&r, line, 256, &chunk_budget);
+            if (e)
+                goto done;
+            UINT32 n = 0, pos = 0;
+            while (line[pos] && line[pos] != ';') {
+                UINT32 x;
+                char c = line[pos++];
+                if (c >= '0' && c <= '9')
+                    x = (UINT32)(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    x = (UINT32)(c - 'a' + 10);
+                else if (c >= 'A' && c <= 'F')
+                    x = (UINT32)(c - 'A' + 10);
+                else {
+                    e = K_EIO;
+                    goto done;
+                }
+                if (n > (capacity - x) / 16) {
+                    e = K_E2BIG;
+                    goto done;
+                }
+                n = n * 16 + x;
+            }
+            if (!pos || line[0] == ';') {
+                e = K_EIO;
+                goto done;
+            }
+            if (n > capacity - *size) {
+                e = K_E2BIG;
+                goto done;
+            }
+            if (!n) {
+                budget = 16384;
+                do {
+                    e = os_http_line(&r, line, sizeof(line), &budget);
+                    if (e)
+                        goto done;
+                } while (line[0]);
+                break;
+            }
+            for (UINT32 i = 0; i < n; ++i) {
+                int c = os_http_byte(&r);
+                if (c < 0) {
+                    e = c;
+                    goto done;
+                }
+                body[(*size)++] = (UINT8)c;
+            }
+            int cr = os_http_byte(&r), lf = cr < 0 ? cr : os_http_byte(&r);
+            if (cr != '\r' || lf != '\n') {
+                e = K_EIO;
+                goto done;
+            }
+        }
+    } else {
+        while (!has_length || *size < length) {
+            int c = os_http_byte(&r);
+            if (c == K_ENOENT && !has_length)
+                break;
+            if (c < 0) {
+                e = c;
+                goto done;
+            }
+            if (*size == capacity) {
+                e = K_E2BIG;
+                goto done;
+            }
+            body[(*size)++] = (UINT8)c;
+        }
+    }
+    e = 0;
+done:
+    k_net_close(h);
+    return e;
+}
+static void cmd_curl(const char *args)
+{
+    char url[1024], dest[K_PATH_MAX] = {0}, word[K_PATH_MAX];
+    if (!path_argument(&args, word)) {
+        con_print("curl http://host/path [-o file] (HTTP, maximum 4 MiB)\n");
+        return;
+    }
+    textcopy_(url, word, sizeof(url));
+    if (*args) {
+        if (!path_argument(&args, word) || !streq_(word, "-o") || !path_argument(&args, word) ||
+            *args) {
+            con_print("curl http://host/path [-o file]\n");
+            return;
+        }
+        int e = k_path_resolve(word, cwd, dest);
+        if (e) {
+            error_("curl path", e);
+            return;
+        }
+    }
+    UINT8 *body = (void *)(UINTN)k_pmm_alloc_pages(1024, 0);
+    if (!body) {
+        error_("curl", K_ENOMEM);
+        return;
+    }
+    UINT32 size = 0, status = 0;
+    int e = 0;
+    for (UINT32 hop = 0; hop < 6; ++hop) {
+        char redirect[1024];
+        con_print("GET ");
+        con_print(url);
+        con_putc('\n');
+        e = os_http_get(url, body, 4194304, &size, &status, redirect);
+        if (e != K_EAGAIN)
+            break;
+        if (hop == 5) {
+            e = K_E2BIG;
+            break;
+        }
+        if (starts_with_(redirect, "http://")) {
+            textcopy_(url, redirect, sizeof(url));
+            continue;
+        }
+        if (redirect[0] == '/' && redirect[1] != '/') {
+            os_http_url previous;
+            e = os_http_url_parse(url, &previous);
+            if (e)
+                break;
+            UINT32 n = (UINT32)strlen_(previous.authority), m = (UINT32)strlen_(redirect);
+            if (n + m + 8 > sizeof(url)) {
+                e = K_E2BIG;
+                break;
+            }
+            copy_(url, "http://", 7);
+            copy_(url + 7, previous.authority, n);
+            copy_(url + 7 + n, redirect, m + 1);
+            continue;
+        }
+        e = K_ENOTSUP;
+        break;
+    }
+    if (!e && dest[0])
+        e = k_vfs_put(dest, body, size);
+    if (e) {
+        con_print("HTTP status ");
+        con_print_uint(status);
+        con_putc('\n');
+        error_("curl", e);
+        if (e == K_ENOTSUP)
+            con_print("HTTPS, compression and non-HTTP redirects require a protocol helper.\n");
+    } else if (dest[0]) {
+        con_print("Saved ");
+        con_print_uint(size);
+        con_print(" bytes to ");
+        con_print(dest);
+        con_putc('\n');
+    } else {
+        UINT32 display = size > 16384 ? 16384 : size;
+        for (UINT32 i = 0; i < display; ++i) {
+            UINT8 c = body[i];
+            con_putc(c == '\n' || c == '\r' || c == '\t' || (c >= 32 && c < 127) ? (char)c : '.');
+        }
+        con_putc('\n');
+        if (display < size)
+            con_print("Display limited to 16 KiB; use -o to save the full response.\n");
+    }
+    k_pmm_free_pages((UINT64)(UINTN)body, 1024);
+}
+static void cmd_wifi(const char *args, BOOLEAN scan)
+{
+    if (!scan) {
+        for (UINT32 i = 0; i < K_WIFI_MAX; ++i) {
+            k_wifi_info info;
+            if (k_wifi_get(i, &info))
+                break;
+            con_print_uint(i);
+            con_putc(' ');
+            con_print_hex(info.vendor);
+            con_putc(':');
+            con_print_hex(info.device);
+            con_putc(' ');
+            con_print(info.driver);
+            con_putc('\n');
+            if (info.error)
+                error_("wifi", info.error);
+        }
+        return;
+    }
+    UINT64 id;
+    if (!number_(&args, &id) || *args || id >= K_WIFI_MAX) {
+        con_print("wifiscan <radio>\n");
+        return;
+    }
+    k_wifi_request request = {0};
+    request.operation = K_WIFI_SCAN;
+    int e = k_wifi_control((UINT32)id, &request);
+    if (e) {
+        error_("wifiscan", e);
+        return;
+    }
+    k_sleep(1000);
+    for (UINT32 i = 0; i < K_WIFI_BSS_MAX; ++i) {
+        k_wifi_bss b;
+        e = k_wifi_scan_result((UINT32)id, i, &b);
+        if (e)
+            break;
+        con_print("channel ");
+        con_print_uint(b.channel);
+        con_putc(' ');
+        for (UINT32 j = 0; j < b.ssid_length; ++j)
+            con_putc(b.ssid[j] >= 32 && b.ssid[j] < 127 ? (char)b.ssid[j] : '.');
+        con_putc('\n');
+    }
+}
+static void cmd_net_send(const char *args, BOOLEAN tcp)
+{
+    char host[K_PATH_MAX];
+    UINT64 port;
+    if (!path_argument(&args, host) || !number_(&args, &port) || !port || port > 65535) {
+        con_print(tcp ? "nc <host> <port> [text]\n" : "udp <host> <port> <text>\n");
+        return;
+    }
+    while (*args == ' ')
+        ++args;
+    k_net_address peer;
+    int e = os_resolve(host, K_NET_ANY_IF, &peer);
+    if (e) {
+        error_("resolve", e);
+        return;
+    }
+    peer.port = (UINT16)port;
+    UINT32 h;
+    e = k_net_socket(peer.family, tcp ? K_SOCK_TCP : K_SOCK_UDP, &h);
+    if (e) {
+        error_("socket", e);
+        return;
+    }
+    e = k_net_connect(h, &peer, 10000);
+    if (!e && *args) {
+        e = k_net_send(h, args, (UINT32)strlen_(args), NULL);
+        if (e >= 0)
+            e = 0;
+    }
+    UINT64 end = k_uptime_ms() + 5000;
+    UINT32 printed = 0;
+    while (!e && k_uptime_ms() < end && printed < 16384) {
+        UINT8 data[1472];
+        int n = k_net_receive(h, data, sizeof(data), NULL);
+        if (n > 0) {
+            for (int i = 0; i < n; ++i)
+                con_putc((data[i] >= 32 && data[i] < 127) || data[i] == '\n' || data[i] == '\r' ||
+                                 data[i] == '\t'
+                             ? (char)data[i]
+                             : '.');
+            printed += (UINT32)n;
+            if (!tcp)
+                break;
+        } else if (!n)
+            break;
+        else if (n != K_EAGAIN) {
+            e = n;
+            break;
+        } else
+            k_sleep(1);
+    }
+    con_putc('\n');
+    k_net_close(h);
+    if (e)
+        error_(tcp ? "nc" : "udp", e);
+}
+typedef struct {
+    UINT32 task, family, ready, done, stop, foreign, cpu, http;
+    INT32 error;
+    k_net_address address;
+} os_net_test_state;
+static os_net_test_state os_net_test;
+static void os_net_test_server(void *arg)
+{
+    os_net_test_state *t = arg;
+    UINT32 listener = 0, client = 0;
+    t->cpu = k_cpu_id();
+    k_socket_info foreign;
+    int e = k_net_socket_get(t->foreign, &foreign);
+    if (e != K_EPERM) {
+        e = K_EIO;
+        goto done;
+    }
+    e = k_net_socket(t->family, K_SOCK_TCP, &listener);
+    if (e)
+        goto done;
+    k_net_address local = {0};
+    local.family = t->family;
+    local.interface = 0;
+    e = k_net_bind(listener, &local);
+    if (e)
+        goto done;
+    e = k_net_listen(listener, 4);
+    if (e)
+        goto done;
+    k_socket_info info;
+    e = k_net_socket_get(listener, &info);
+    if (e)
+        goto done;
+    t->address = info.local;
+    if (t->family == 4) {
+        t->address.bytes[0] = 127;
+        t->address.bytes[3] = 1;
+    } else
+        t->address.bytes[15] = 1;
+    __atomic_store_n(&t->ready, 1, __ATOMIC_RELEASE);
+    UINT64 until = k_uptime_ms() + 8000;
+    while (k_uptime_ms() < until && !__atomic_load_n(&t->stop, __ATOMIC_ACQUIRE)) {
+        e = k_net_accept(listener, &client, NULL);
+        if (!e)
+            break;
+        if (e != K_EAGAIN)
+            goto done;
+        k_sleep(1);
+    }
+    if (!client) {
+        e = K_ETIMEDOUT;
+        goto done;
+    }
+    if (t->http) {
+        os_http_reader reader = {0};
+        reader.socket = client;
+        reader.started = reader.last = k_uptime_ms();
+        char line[1600];
+        UINT32 budget = 4096;
+        do {
+            e = os_http_line(&reader, line, sizeof(line), &budget);
+            if (e)
+                goto done;
+        } while (line[0]);
+        const char *reply =
+            t->http == 1   ? "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: "
+                             "close\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
+            : t->http == 2 ? "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nabc"
+                           : "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: "
+                             "chunked\r\n\r\n0\r\n\r\n";
+        e = os_net_send_all(client, (const UINT8 *)reply, (UINT32)strlen_(reply), 4000);
+        goto done;
+    }
+    UINT8 bytes[4096];
+    UINT32 total = 0;
+    while (total < 32768 && !__atomic_load_n(&t->stop, __ATOMIC_ACQUIRE)) {
+        int n = k_net_receive(client, bytes, sizeof(bytes), NULL);
+        if (n > 0) {
+            e = os_net_send_all(client, bytes, (UINT32)n, 4000);
+            if (e)
+                goto done;
+            total += (UINT32)n;
+            until = k_uptime_ms() + 8000;
+        } else if (!n) {
+            e = K_EIO;
+            goto done;
+        } else if (n != K_EAGAIN) {
+            e = n;
+            goto done;
+        } else if (k_uptime_ms() >= until) {
+            e = K_ETIMEDOUT;
+            goto done;
+        } else
+            k_sleep(1);
+    }
+    e = total == 32768 ? 0 : K_ECANCELED;
+done:
+    if (client)
+        k_net_close(client);
+    if (listener)
+        k_net_close(listener);
+    t->error = e;
+    __atomic_store_n(&t->done, 1, __ATOMIC_RELEASE);
+}
+static BOOLEAN os_net_tcp_test(UINT32 family, UINT32 cpu)
+{
+    if (os_net_test.task) {
+        if (k_task_reap(os_net_test.task, NULL))
+            return FALSE;
+        os_net_test.task = 0;
+    }
+    zero_(&os_net_test, sizeof(os_net_test));
+    UINT32 client = 0;
+    int e = k_net_socket(family, K_SOCK_TCP, &client);
+    if (e)
+        return FALSE;
+    os_net_test.family = family;
+    os_net_test.foreign = client;
+    e = k_task_create("net-echo", os_net_test_server, &os_net_test, 512, cpu, &os_net_test.task);
+    if (e) {
+        k_net_close(client);
+        return FALSE;
+    }
+    UINT64 start = k_uptime_ms();
+    while (!__atomic_load_n(&os_net_test.ready, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&os_net_test.done, __ATOMIC_ACQUIRE) && k_uptime_ms() - start < 3000)
+        k_sleep(1);
+    if (!__atomic_load_n(&os_net_test.ready, __ATOMIC_ACQUIRE))
+        e = K_ETIMEDOUT;
+    else
+        e = k_net_connect(client, &os_net_test.address, 4000);
+    UINT8 tx[4096], rx[4096];
+    for (UINT32 block = 0; !e && block < 8; ++block) {
+        for (UINT32 i = 0; i < sizeof(tx); ++i)
+            tx[i] = (UINT8)(i * 17 + block * 31);
+        e = os_net_send_all(client, tx, sizeof(tx), 4000);
+        if (!e)
+            e = os_net_read_exact(client, rx, sizeof(rx), 4000);
+        if (!e && !equal_(tx, rx, sizeof(tx)))
+            e = K_EIO;
+    }
+    if (!e) {
+        start = k_uptime_ms();
+        for (;;) {
+            int n = k_net_receive(client, rx, 1, NULL);
+            if (!n)
+                break;
+            if (n != K_EAGAIN) {
+                e = n < 0 ? n : K_EIO;
+                break;
+            }
+            if (k_uptime_ms() - start >= 4000) {
+                e = K_ETIMEDOUT;
+                break;
+            }
+            k_sleep(1);
+        }
+    }
+    k_net_close(client);
+    __atomic_store_n(&os_net_test.stop, 1, __ATOMIC_RELEASE);
+    start = k_uptime_ms();
+    while (k_uptime_ms() - start < 5000) {
+        if (!k_task_reap(os_net_test.task, NULL)) {
+            os_net_test.task = 0;
+            break;
+        }
+        k_sleep(1);
+    }
+    BOOLEAN ok = !e && !os_net_test.task && __atomic_load_n(&os_net_test.done, __ATOMIC_ACQUIRE) &&
+                 !os_net_test.error && os_net_test.cpu == cpu;
+    if (!ok) {
+        con_print("TCP test client/server error: ");
+        con_print_int(e);
+        con_putc('/');
+        con_print_int(os_net_test.error);
+        con_putc('\n');
+    }
+    return ok;
+}
+static BOOLEAN os_net_http_test(UINT32 mode)
+{
+    if (os_net_test.task) {
+        if (k_task_reap(os_net_test.task, NULL))
+            return FALSE;
+        os_net_test.task = 0;
+    }
+    zero_(&os_net_test, sizeof(os_net_test));
+    os_net_test.family = 4;
+    os_net_test.http = mode;
+    int e = k_task_create("http-test", os_net_test_server, &os_net_test, 512, 0, &os_net_test.task);
+    if (e)
+        return FALSE;
+    UINT64 start = k_uptime_ms();
+    while (!__atomic_load_n(&os_net_test.ready, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&os_net_test.done, __ATOMIC_ACQUIRE) && k_uptime_ms() - start < 3000)
+        k_sleep(1);
+    BOOLEAN ready = __atomic_load_n(&os_net_test.ready, __ATOMIC_ACQUIRE);
+    UINT32 n = 0, status = 0;
+    UINT8 body[32];
+    if (ready) {
+        char url[80] = "http://127.0.0.1:", digits[6], redirect[1024];
+        UINT32 p = os_net_test.address.port, count = 0, at = 17;
+        do {
+            digits[count++] = (char)('0' + p % 10);
+            p /= 10;
+        } while (p);
+        while (count)
+            url[at++] = digits[--count];
+        url[at++] = '/';
+        url[at] = 0;
+        e = os_http_get(url, body, sizeof(body), &n, &status, redirect);
+    } else
+        e = K_ETIMEDOUT;
+    BOOLEAN ok = ready && status == 200 &&
+                 (mode == 1   ? (!e && n == 5 && equal_(body, "abcde", 5))
+                  : mode == 2 ? e == K_ENOENT
+                              : e == K_EIO);
+    __atomic_store_n(&os_net_test.stop, 1, __ATOMIC_RELEASE);
+    start = k_uptime_ms();
+    while (k_uptime_ms() - start < 5000) {
+        if (!k_task_reap(os_net_test.task, NULL)) {
+            os_net_test.task = 0;
+            break;
+        }
+        k_sleep(1);
+    }
+    return ok && !os_net_test.task && !os_net_test.error;
+}
+static BOOLEAN os_net_udp_test(UINT32 family)
+{
+    UINT32 h = 0;
+    int e = k_net_socket(family, K_SOCK_UDP, &h);
+    if (e)
+        return FALSE;
+    k_net_address a = {0};
+    a.family = family;
+    a.interface = 0;
+    if (family == 4) {
+        a.bytes[0] = 127;
+        a.bytes[3] = 1;
+    } else
+        a.bytes[15] = 1;
+    e = k_net_bind(h, &a);
+    k_socket_info info;
+    if (!e)
+        e = k_net_socket_get(h, &info);
+    if (!e)
+        a.port = info.local.port;
+    const UINT8 msg[] = {0, 1, 2, 255, 4, 7, 0, 9};
+    UINT8 rx[8];
+    k_net_address source = {0};
+    if (!e) {
+        e = k_net_send(h, msg, sizeof(msg), &a);
+        if (e == (int)sizeof(msg))
+            e = 0;
+        else if (e >= 0)
+            e = K_EIO;
+    }
+    UINT64 end = k_uptime_ms() + 2000;
+    if (!e) {
+        int n;
+        do {
+            n = k_net_receive(h, rx, 1, &source);
+            if (n != K_EAGAIN)
+                break;
+            k_sleep(1);
+        } while (k_uptime_ms() < end);
+        if (n != K_EMSGSIZE)
+            e = K_EIO;
+        else {
+            n = k_net_receive(h, rx, sizeof(rx), &source);
+            if (n != (int)sizeof(msg) || !equal_(rx, msg, sizeof(msg)) || source.port != a.port)
+                e = K_EIO;
+        }
+    }
+    if (!e) {
+        e = k_net_send(h, NULL, 0, &a);
+        end = k_uptime_ms() + 2000;
+        if (!e) {
+            do {
+                e = k_net_receive(h, NULL, 0, NULL);
+                if (e != K_EAGAIN)
+                    break;
+                k_sleep(1);
+            } while (k_uptime_ms() < end);
+        }
+    }
+    int closed = k_net_close(h);
+    k_socket_info stale;
+    return !e && !closed && k_net_socket_get(h, &stale) == K_EPERM;
+}
+static const UINT8 net_fixture[] = {
+    0x52, 0x49, 0x45, 0x46, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x20, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x05, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x28, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6d, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6d, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x98, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x13, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6d, 0x61, 0x69, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x48, 0x83, 0xec, 0x08, 0xe8, 0x09, 0x00, 0x00,
+    0x00, 0x48, 0x89, 0xc7, 0x31, 0xc0, 0x0f, 0x05, 0x0f, 0x0b, 0x55, 0x48, 0x89, 0xe5, 0x48, 0x81,
+    0xec, 0xf0, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x85, 0x40, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8d, 0x85,
+    0xe4, 0xff, 0xff, 0xff, 0x41, 0x5a, 0x49, 0x89, 0x02, 0x48, 0x8d, 0x85, 0x38, 0xff, 0xff, 0xff,
+    0x50, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x89, 0x02,
+    0x48, 0x8d, 0x85, 0x38, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8, 0x1c, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x9c, 0xc0, 0x0f, 0xb6, 0xc0,
+    0x48, 0x85, 0xc0, 0x0f, 0x84, 0x55, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x85, 0x40, 0xff, 0xff, 0xff,
+    0x48, 0x8b, 0x00, 0x50, 0x48, 0x8d, 0x85, 0x38, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x41, 0x5a,
+    0x48, 0x69, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x4c, 0x01, 0xd0, 0x50, 0x48, 0xb8, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x0f, 0xb6, 0xc0, 0x41, 0x88, 0x02, 0x48, 0x8d, 0x85,
+    0x38, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8b, 0x00, 0x49, 0x89, 0xc3, 0x48, 0x05, 0x01, 0x00, 0x00,
+    0x00, 0x41, 0x5a, 0x49, 0x89, 0x02, 0x4c, 0x89, 0xd8, 0xe9, 0x82, 0xff, 0xff, 0xff, 0x48, 0x8d,
+    0x85, 0x30, 0xff, 0xff, 0xff, 0x50, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x41, 0x5a, 0x49, 0x89, 0x02, 0x48, 0x8d, 0x85, 0x30, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50,
+    0x48, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f,
+    0x9c, 0xc0, 0x0f, 0xb6, 0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x52, 0x00, 0x00, 0x00, 0x48, 0x8d,
+    0x85, 0x50, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8d, 0x85, 0x30, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00,
+    0x41, 0x5a, 0x48, 0x69, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x4c, 0x01, 0xd0, 0x50, 0x48, 0xb8, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x0f, 0xb6, 0xc0, 0x41, 0x88, 0x02, 0x48,
+    0x8d, 0x85, 0x30, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8b, 0x00, 0x49, 0x89, 0xc3, 0x48, 0x05, 0x01,
+    0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x89, 0x02, 0x4c, 0x89, 0xd8, 0xe9, 0x85, 0xff, 0xff, 0xff,
+    0x48, 0x8d, 0x85, 0xe4, 0xff, 0xff, 0xff, 0x48, 0x05, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0xb8,
+    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x89, 0xc0, 0x41, 0x89, 0x02, 0x48,
+    0x8d, 0x85, 0xe4, 0xff, 0xff, 0xff, 0x48, 0x05, 0x04, 0x00, 0x00, 0x00, 0x50, 0x48, 0xb8, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x89, 0xc0, 0x41, 0x89, 0x02, 0x48, 0x8d,
+    0x85, 0xe4, 0xff, 0xff, 0xff, 0x48, 0x05, 0x0c, 0x00, 0x00, 0x00, 0x50, 0x48, 0xb8, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x48, 0x69, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x4c,
+    0x01, 0xd0, 0x50, 0x48, 0xb8, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x0f,
+    0xb6, 0xc0, 0x41, 0x88, 0x02, 0x48, 0x8d, 0x85, 0xe4, 0xff, 0xff, 0xff, 0x48, 0x05, 0x0c, 0x00,
+    0x00, 0x00, 0x50, 0x48, 0xb8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x48,
+    0x69, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x4c, 0x01, 0xd0, 0x50, 0x48, 0xb8, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x0f, 0xb6, 0xc0, 0x41, 0x88, 0x02, 0x48, 0x8d, 0x85, 0x28,
+    0xff, 0xff, 0xff, 0x50, 0x48, 0xb8, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48,
+    0xb8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0x8b, 0xbc, 0x24, 0x08, 0x00,
+    0x00, 0x00, 0x48, 0x8b, 0xb4, 0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x1f, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x48, 0x81, 0xc4, 0x10, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x41, 0x5a, 0x49,
+    0x89, 0x02, 0x48, 0x8d, 0x85, 0x28, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x9c, 0xc0, 0x0f,
+    0xb6, 0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xe9, 0xe9, 0x06, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x48,
+    0x8d, 0x85, 0x28, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0x8d, 0x85, 0xe4, 0xff, 0xff,
+    0xff, 0x50, 0x48, 0x8b, 0xbc, 0x24, 0x08, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xb4, 0x24, 0x00, 0x00,
+    0x00, 0x00, 0x48, 0xb8, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x81, 0xc4, 0x10,
+    0x00, 0x00, 0x00, 0x0f, 0x05, 0x50, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x9c, 0xc0, 0x0f, 0xb6, 0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84,
+    0x14, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe9, 0x80,
+    0x06, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x85, 0x28, 0xff, 0xff, 0xff, 0x48,
+    0x8b, 0x00, 0x50, 0x48, 0x8d, 0x85, 0x8c, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8b, 0xbc, 0x24, 0x08,
+    0x00, 0x00, 0x00, 0x48, 0x8b, 0xb4, 0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x27, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x81, 0xc4, 0x10, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x50, 0x48,
+    0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x9c,
+    0xc0, 0x0f, 0xb6, 0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x03,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe9, 0x17, 0x06, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00,
+    0x00, 0x48, 0x8d, 0x85, 0xe4, 0xff, 0xff, 0xff, 0x48, 0x05, 0x08, 0x00, 0x00, 0x00, 0x50, 0x48,
+    0x8d, 0x85, 0x8c, 0xff, 0xff, 0xff, 0x48, 0x05, 0x10, 0x00, 0x00, 0x00, 0x48, 0x05, 0x08, 0x00,
+    0x00, 0x00, 0x0f, 0xb7, 0x00, 0x41, 0x5a, 0x0f, 0xb7, 0xc0, 0x66, 0x41, 0x89, 0x02, 0x48, 0x8d,
+    0x85, 0x28, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x50, 0x48, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48,
+    0x8d, 0x85, 0xe4, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8b, 0xbc, 0x24, 0x18, 0x00, 0x00, 0x00, 0x48,
+    0x8b, 0xb4, 0x24, 0x10, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x94, 0x24, 0x08, 0x00, 0x00, 0x00, 0x4c,
+    0x8b, 0x94, 0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x48, 0x81, 0xc4, 0x20, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x50, 0x48, 0xb8, 0x05, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xf7, 0xd8, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x95, 0xc0,
+    0x0f, 0xb6, 0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe9, 0x58, 0x05, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0x8d, 0x85, 0x50, 0xff,
+    0xff, 0xff, 0x50, 0x48, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0x8b,
+    0xbc, 0x24, 0x10, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xb4, 0x24, 0x08, 0x00, 0x00, 0x00, 0x48, 0x8b,
+    0x94, 0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x48, 0x81, 0xc4, 0x18, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x50, 0x48, 0xb8, 0x0b, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x48, 0xf7, 0xd8, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x95, 0xc0, 0x0f,
+    0xb6, 0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x05, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xe9, 0xd9, 0x04, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x48,
+    0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0x8b, 0xbc, 0x24, 0x08, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xb4,
+    0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48,
+    0x81, 0xc4, 0x10, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x50, 0x48, 0xb8, 0x0b, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x48, 0xf7, 0xd8, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x95, 0xc0, 0x0f, 0xb6,
+    0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x06, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xe9, 0x6a, 0x04, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d,
+    0x85, 0x28, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x50, 0x48, 0xb8, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48,
+    0x8d, 0x85, 0xe4, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8b, 0xbc, 0x24, 0x18, 0x00, 0x00, 0x00, 0x48,
+    0x8b, 0xb4, 0x24, 0x10, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x94, 0x24, 0x08, 0x00, 0x00, 0x00, 0x4c,
+    0x8b, 0x94, 0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x48, 0x81, 0xc4, 0x20, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x50, 0x48, 0xb8, 0x07, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x95, 0xc0, 0x0f, 0xb6, 0xc0,
+    0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x07, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xe9, 0xdb, 0x03, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x85,
+    0x20, 0xff, 0xff, 0xff, 0x50, 0x48, 0xb8, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48,
+    0xf7, 0xd8, 0x41, 0x5a, 0x49, 0x89, 0x02, 0x48, 0x8d, 0x85, 0x18, 0xff, 0xff, 0xff, 0x50, 0x48,
+    0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x89, 0x02, 0x48, 0x8d,
+    0x85, 0x18, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8, 0xf4, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x9c, 0xc0, 0x0f, 0xb6, 0xc0, 0x48, 0x85,
+    0xc0, 0x0f, 0x84, 0x92, 0x01, 0x00, 0x00, 0x48, 0x8d, 0x85, 0x20, 0xff, 0xff, 0xff, 0x50, 0x48,
+    0x8d, 0x85, 0x28, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0xb8, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50,
+    0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0x8b, 0xbc, 0x24, 0x18,
+    0x00, 0x00, 0x00, 0x48, 0x8b, 0xb4, 0x24, 0x10, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x94, 0x24, 0x08,
+    0x00, 0x00, 0x00, 0x4c, 0x8b, 0x94, 0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x25, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x81, 0xc4, 0x20, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x41, 0x5a,
+    0x49, 0x89, 0x02, 0x48, 0x8d, 0x85, 0x20, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8,
+    0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0xf7, 0xd8, 0x41, 0x5a, 0x49, 0x39, 0xc2,
+    0x0f, 0x95, 0xc0, 0x0f, 0xb6, 0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00, 0x00, 0x00, 0x48,
+    0xb8, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe9, 0xd5, 0x02, 0x00, 0x00, 0xe9, 0x00,
+    0x00, 0x00, 0x00, 0x48, 0x8d, 0x85, 0x20, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8d, 0x85, 0x28, 0xff,
+    0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0x8d, 0x85, 0x48, 0xff, 0xff, 0xff, 0x50, 0x48, 0xb8,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x50, 0x48, 0x8b, 0xbc, 0x24, 0x18, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xb4, 0x24,
+    0x10, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x94, 0x24, 0x08, 0x00, 0x00, 0x00, 0x4c, 0x8b, 0x94, 0x24,
+    0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x81,
+    0xc4, 0x20, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x41, 0x5a, 0x49, 0x89, 0x02, 0x48, 0x8d, 0x85, 0x20,
+    0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x48, 0xf7, 0xd8, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x95, 0xc0, 0x0f, 0xb6, 0xc0, 0x48,
+    0x85, 0xc0, 0x0f, 0x84, 0x0a, 0x00, 0x00, 0x00, 0xe9, 0x4c, 0x00, 0x00, 0x00, 0xe9, 0x00, 0x00,
+    0x00, 0x00, 0x48, 0xb8, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x48, 0x8b, 0xbc,
+    0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48,
+    0x81, 0xc4, 0x08, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x8d, 0x85, 0x18, 0xff, 0xff, 0xff, 0x50,
+    0x48, 0x8b, 0x00, 0x49, 0x89, 0xc3, 0x48, 0x05, 0x01, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x89,
+    0x02, 0x4c, 0x89, 0xd8, 0xe9, 0x45, 0xfe, 0xff, 0xff, 0x48, 0x8d, 0x85, 0x20, 0xff, 0xff, 0xff,
+    0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a,
+    0x49, 0x39, 0xc2, 0x0f, 0x95, 0xc0, 0x0f, 0xb6, 0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00,
+    0x00, 0x00, 0x48, 0xb8, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe9, 0xb2, 0x01, 0x00,
+    0x00, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x85, 0x10, 0xff, 0xff, 0xff, 0x50, 0x48, 0xb8,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x89, 0x02, 0x48, 0x8d, 0x85,
+    0x10, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0xb8, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x9c, 0xc0, 0x0f, 0xb6, 0xc0, 0x48, 0x85, 0xc0,
+    0x0f, 0x84, 0x8f, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x85, 0x48, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8d,
+    0x85, 0x10, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x41, 0x5a, 0x48, 0x69, 0xc0, 0x01, 0x00, 0x00,
+    0x00, 0x4c, 0x01, 0xd0, 0x0f, 0xb6, 0x00, 0x50, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x50, 0x48, 0x8d, 0x85, 0x10, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x41, 0x5a, 0x48,
+    0x69, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x4c, 0x01, 0xd0, 0x0f, 0xb6, 0x00, 0x41, 0x5a, 0x49, 0x39,
+    0xc2, 0x0f, 0x95, 0xc0, 0x0f, 0xb6, 0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00, 0x00, 0x00,
+    0x48, 0xb8, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe9, 0x04, 0x01, 0x00, 0x00, 0xe9,
+    0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x85, 0x10, 0xff, 0xff, 0xff, 0x50, 0x48, 0x8b, 0x00, 0x49,
+    0x89, 0xc3, 0x48, 0x05, 0x01, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x89, 0x02, 0x4c, 0x89, 0xd8,
+    0xe9, 0x48, 0xff, 0xff, 0xff, 0x48, 0x8d, 0x85, 0x28, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50,
+    0x48, 0x8b, 0xbc, 0x24, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x26, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x48, 0x81, 0xc4, 0x08, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x50, 0x48, 0xb8, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x95, 0xc0, 0x0f, 0xb6,
+    0xc0, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0x14, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x0b, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xe9, 0x8a, 0x00, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d,
+    0x85, 0x28, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x00, 0x50, 0x48, 0x8d, 0x85, 0x8c, 0xff, 0xff, 0xff,
+    0x50, 0x48, 0x8b, 0xbc, 0x24, 0x08, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xb4, 0x24, 0x00, 0x00, 0x00,
+    0x00, 0x48, 0xb8, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x81, 0xc4, 0x10, 0x00,
+    0x00, 0x00, 0x0f, 0x05, 0x50, 0x48, 0xb8, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48,
+    0xf7, 0xd8, 0x41, 0x5a, 0x49, 0x39, 0xc2, 0x0f, 0x95, 0xc0, 0x0f, 0xb6, 0xc0, 0x48, 0x85, 0xc0,
+    0x0f, 0x84, 0x14, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xe9, 0x1e, 0x00, 0x00, 0x00, 0xe9, 0x00, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xe9, 0x0a, 0x00, 0x00, 0x00, 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xc9, 0xc3, 0x00, 0x00, 0x00, 0x52, 0x49, 0x45, 0x46, 0x6e, 0x65, 0x74, 0x00,
+    0x52, 0x49, 0x45, 0x46, 0x6e, 0x65, 0x74, 0x00,
+};
+static void cmd_netusertest(UINT32 cpu)
+{
+    UINT32 pid = 0;
+    k_process_info info;
+    int e = k_process_launch("@system/bin/netcheck.rief", "", K_EXEC_RING3, cpu, 0, &pid);
+    BOOLEAN done = !e && wait_process(pid, 8000, &info);
+    report("RIEF socket syscalls, pointer validation and raw-network privilege boundary",
+           done && !info.exit_code && !info.fault_vector && info.cpu == cpu);
+    if (!e) {
+        if (done)
+            reap_after_test(pid);
+        else
+            (void)k_process_control(pid, K_CTL_KILL);
+    }
+}
+static BOOLEAN os_net_refused(UINT32 family, UINT32 type)
+{
+    UINT32 reservation = 0, h = 0;
+    k_net_address a = {0};
+    a.family = family;
+    a.interface = 0;
+    if (family == 4) {
+        a.bytes[0] = 127;
+        a.bytes[3] = 1;
+    } else
+        a.bytes[15] = 1;
+    int e = k_net_socket(family, type, &reservation);
+    if (e)
+        return FALSE;
+    e = k_net_bind(reservation, &a);
+    k_socket_info info;
+    if (!e)
+        e = k_net_socket_get(reservation, &info);
+    if (!e)
+        a.port = info.local.port;
+    k_net_close(reservation);
+    if (e)
+        return FALSE;
+    e = k_net_socket(family, type, &h);
+    if (e)
+        return FALSE;
+    e = k_net_connect(h, &a, 2000);
+    if (type == K_SOCK_UDP && !e) {
+        e = k_net_send(h, "x", 1, NULL);
+        if (e == 1) {
+            UINT64 end = k_uptime_ms() + 2000;
+            UINT8 byte;
+            do {
+                e = k_net_receive(h, &byte, 1, NULL);
+                if (e != K_EAGAIN)
+                    break;
+                k_sleep(1);
+            } while (k_uptime_ms() < end);
+        }
+    }
+    k_net_close(h);
+    return e == K_ECONNREFUSED;
+}
+static void cmd_nettest(BOOLEAN smp)
+{
+    k_net_info initialized;
+    if (k_net_get(0, &initialized)) {
+        report("network initialized", FALSE);
+        return;
+    }
+    if (smp) {
+        UINT32 cpu = 0;
+        for (UINT32 i = 1; i < k_platform()->discovered_cpus; ++i) {
+            k_cpu_info info;
+            if (!k_cpu_get(i, &info) && info.online) {
+                cpu = i;
+                break;
+            }
+        }
+        if (!cpu) {
+            con_print("Run smpstart first, then netsmp.\n");
+            return;
+        }
+        report("TCP IPv4 socket isolation and stream echo across BSP/AP", os_net_tcp_test(4, cpu));
+        report("TCP IPv6 socket isolation and stream echo across BSP/AP", os_net_tcp_test(6, cpu));
+        cmd_netusertest(cpu);
+        return;
+    }
+    cmd_netusertest(0);
+    k_net_address a, b;
+    char text[48];
+    BOOLEAN parse = !k_net_parse("192.0.2.123", 4, &a) && !k_net_format(&a, text, sizeof(text)) &&
+                    streq_(text, "192.0.2.123") && k_net_parse("256.1.2.3", 4, &a) == K_EINVAL &&
+                    k_net_parse("1.2.3", 4, &a) == K_EINVAL &&
+                    !k_net_parse("2001:db8::1234", 6, &a) &&
+                    !k_net_format(&a, text, sizeof(text)) && !k_net_parse(text, 6, &b) &&
+                    equal_(a.bytes, b.bytes, 16) && k_net_parse("1::2::3", 6, &a) == K_EINVAL;
+    report("IPv4/IPv6 address roundtrip and malformed address rejection", parse);
+    UINT8 header[20] = {0x45, 0, 0,    0x73, 0, 0, 0x40, 0,    0x40, 0x11,
+                        0,    0, 0xc0, 0xa8, 0, 1, 0xc0, 0xa8, 0,    0xc7};
+    UINT16 sum = k_net_checksum(header, 20);
+    os_put16(header + 10, sum);
+    report("Internet checksum known vector and full-header verification",
+           sum == 0xb861 && !k_net_checksum(header, 20));
+    report("UDP IPv4 delivery, datagram size, zero length and stale handles", os_net_udp_test(4));
+    report("UDP IPv6 delivery and mandatory checksum", os_net_udp_test(6));
+    report("TCP IPv4 accept, ownership, 32 KiB stream and orderly EOF", os_net_tcp_test(4, 0));
+    report("TCP IPv6 accept, ownership, 32 KiB stream and orderly EOF", os_net_tcp_test(6, 0));
+    report("HTTP chunked decoding over local TCP", os_net_http_test(1));
+    report("HTTP truncated Content-Length rejected", os_net_http_test(2));
+    report("HTTP conflicting framing rejected", os_net_http_test(3));
+    report("TCP reset on a closed local port",
+           os_net_refused(4, K_SOCK_TCP) && os_net_refused(6, K_SOCK_TCP));
+    report("ICMP unreachable delivered to UDP sockets",
+           os_net_refused(4, K_SOCK_UDP) && os_net_refused(6, K_SOCK_UDP));
+    UINT32 elapsed = 0;
+    k_net_parse("127.0.0.1", 4, &a);
+    report("ICMPv4 echo request and reply", !k_net_ping(&a, 2000, &elapsed));
+    k_net_parse("::1", 6, &a);
+    report("ICMPv6 echo request and reply", !k_net_ping(&a, 2000, &elapsed));
+    k_net_info before, after;
+    k_net_get(0, &before);
+    k_net_frame capture = {0};
+    int e = k_net_raw_receive(0, &capture);
+    BOOLEAN capture_ok = e == K_EAGAIN;
+    UINT8 frame[60] = {0};
+    copy_(frame, before.mac, 6);
+    copy_(frame + 6, before.mac, 6);
+    os_put16(frame + 12, 0x800);
+    copy_(frame + 14, header, 20);
+    frame[14 + 10] ^= 1;
+    if (capture_ok) {
+        e = k_net_raw_send(0, frame, sizeof(frame));
+        UINT64 end = k_uptime_ms() + 1000;
+        while (!e && k_uptime_ms() < end) {
+            e = k_net_raw_receive(0, &capture);
+            if (e != K_EAGAIN)
+                break;
+            e = 0;
+            k_sleep(1);
+        }
+        capture_ok =
+            !e && capture.length == sizeof(frame) && equal_(capture.bytes, frame, sizeof(frame));
+        k_sleep(20);
+        k_net_get(0, &after);
+        capture_ok = capture_ok && after.errors > before.errors;
+    }
+    k_net_raw_receive(0, NULL);
+    report("raw Ethernet capture and malformed IPv4 rejection", capture_ok);
+    UINT8 beacon[64] = {0};
+    beacon[0] = 0x80;
+    beacon[16] = 2;
+    beacon[21] = 1;
+    beacon[36] = 0;
+    beacon[37] = 3;
+    copy_(beacon + 38, "lab", 3);
+    beacon[41] = 3;
+    beacon[42] = 1;
+    beacon[43] = 6;
+    k_wifi_bss bss;
+    report("802.11 beacon SSID/channel parser and truncated IE rejection",
+           !k_wifi_decode_beacon(beacon, 44, &bss) && bss.ssid_length == 3 && bss.channel == 6 &&
+               k_wifi_decode_beacon(beacon, 43, &bss) == K_EINVAL);
+}
+static void cmd_netlive(const char *args)
+{
+    UINT64 id;
+    if (!number_(&args, &id) || *args || !id || id >= k_net_count()) {
+        con_print("netlive <interface> (requires network configuration)\n");
+        return;
+    }
+    k_net_info info;
+    int e = k_net_get((UINT32)id, &info);
+    if (e) {
+        error_("netlive", e);
+        return;
+    }
+    report("physical NIC driver initialized and carrier present",
+           !info.error && (info.flags & K_NET_LINK));
+    k_net_address a = {0};
+    a.family = 4;
+    a.interface = (UINT32)id;
+    copy_(a.bytes, info.config.gateway, 4);
+    UINT32 ms;
+    if (!os_bytes_zero(a.bytes, 4)) {
+        e = k_net_ping(&a, 3000, &ms);
+        report("configured gateway answers ICMP (router may filter it)", !e);
+    } else
+        con_print("No IPv4 gateway configured. Use dhcp or ip.\n");
+}
+static BOOLEAN os_net_command(const char *line)
+{
+    if (streq_(line, "net"))
+        cmd_net();
+    else if (streq_(line, "nettest"))
+        cmd_nettest(FALSE);
+    else if (streq_(line, "netsmp"))
+        cmd_nettest(TRUE);
+    else if (starts_with_(line, "netlive "))
+        cmd_netlive(line + 8);
+    else if (starts_with_(line, "dhcp "))
+        cmd_dhcp(line + 5);
+    else if (starts_with_(line, "netup "))
+        cmd_netup(line + 6, TRUE);
+    else if (starts_with_(line, "netdown "))
+        cmd_netup(line + 8, FALSE);
+    else if (starts_with_(line, "ip "))
+        cmd_ip(line + 3, FALSE);
+    else if (starts_with_(line, "ip6 "))
+        cmd_ip(line + 4, TRUE);
+    else if (starts_with_(line, "ping "))
+        cmd_ping(line + 5);
+    else if (starts_with_(line, "dns "))
+        cmd_dns(line + 4);
+    else if (starts_with_(line, "curl "))
+        cmd_curl(line + 5);
+    else if (streq_(line, "wifi"))
+        cmd_wifi("", FALSE);
+    else if (starts_with_(line, "wifiscan "))
+        cmd_wifi(line + 9, TRUE);
+    else if (starts_with_(line, "udp "))
+        cmd_net_send(line + 4, FALSE);
+    else if (starts_with_(line, "nc "))
+        cmd_net_send(line + 3, TRUE);
+    else
+        return FALSE;
+    return TRUE;
+}
+
 static void cmd_help(void)
 {
+    con_print("net | dhcp <if> | netup/netdown <if> | ip/ip6 <if> <addresses>\n");
+    con_print("ping <host> [if] | dns <host> | curl http://host/path [-o file]\n");
+    con_print("udp/nc <host> <port> [text] | wifi | wifiscan <radio>\n");
+    con_print("nettest (local only) | netsmp | netlive <if> (LAN)\n");
     con_print("inputdevices / inputtest / mousetest -- USB and PS/2 input; ESC leaves mousetest\n");
     con_print("Mouse wheel scrolls console history; typing returns to the prompt.\n");
     con_print("cachetest / consoletest -- RAM cache and visual scroll diagnostics\n");
@@ -2618,6 +4791,7 @@ static void cmd_testall(void)
     cmd_disktest();
     cmd_ramdisktest();
     cmd_fatwritetest();
+    cmd_nettest(FALSE);
     con_print("Live results: ");
     con_print_uint(passes);
     con_print(" passed, ");
@@ -2730,7 +4904,7 @@ static BOOLEAN exit_boot_services(EFI_HANDLE image)
             return FALSE;
         s = BS->ExitBootServices(image, key);
         if (!EFI_ERROR(s)) {
-            __asm__ volatile("cli" ::: "memory");
+            kernel_interrupts_disable();
             snap_entries = size / stride;
             UINT64 total = 0, free = 0;
             for (UINTN i = 0; i < snap_entries; ++i) {
@@ -3104,6 +5278,8 @@ static void namespace_setup(void)
     UINT8 bytes[1024];
     UINT32 n = make_rief(bytes, hello_code, sizeof(hello_code), hello_data, sizeof(hello_data) - 1,
                          1, 12, RIEF_RELOC_ABS64);
+    if (k_vfs_put("/system/bin/netcheck.rief", net_fixture, sizeof(net_fixture)))
+        error_("network fixture", K_EIO);
     if (k_vfs_put("/system/bin/hello.rief", bytes, n))
         kernel_halt("built-in application allocation failed");
     if (k_vfs_put("/system/bin/ring1check.rief", ring1_fixture, sizeof(ring1_fixture)) ||
@@ -3125,6 +5301,8 @@ static void os_shell_task(void *unused)
     for (;;) {
         con_print("mini-os> ");
         if (!kb_read_line(line, sizeof(line)))
+            continue;
+        if (os_net_command(line))
             continue;
         if (streq_(line, "help"))
             cmd_help();
@@ -3357,6 +5535,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *system_table)
     e = k_vfs_mount_disks();
     if (e)
         error_("volume discovery", e);
+    e = k_net_init();
+    if (e)
+        error_("network", e);
+    else {
+        UINT32 worker;
+        e = k_task_create("dhcp", os_dhcp_worker, NULL, 256, 0, &worker);
+        if (e)
+            error_("DHCP worker", e);
+    }
     kernel_usb_init();
     os_input_init();
     con_print("\nFAT16/32, ext4 and NTFS file writes; bounded layouts. RAM is volatile.\n");

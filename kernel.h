@@ -76,6 +76,9 @@ int k_i8042_enable(UINT32 port);
 int k_i8042_exchange(UINT32 port, UINT8 byte, UINT8 *response, UINT32 size);
 void kernel_interrupts_init(void);
 void kernel_interrupts_enable(void);
+void kernel_interrupts_disable(void);
+void k_cpu_relax(void);
+BOOLEAN k_cpu_caches_enabled(void);
 __attribute__((noreturn)) void kernel_halt(const char *);
 
 typedef struct {
@@ -246,6 +249,136 @@ int k_root_bind(const char *name, const char *absolute_path);
 int k_path_resolve(const char *path, const char *cwd, char out[K_PATH_MAX]);
 void k_roots_list(void (*callback)(const char *, const char *, void *), void *);
 void k_mounts_list(void (*callback)(const char *, const char *, void *), void *);
+
+/* Networking: byte-array addresses are in wire order; ports are host order. */
+#define K_AF_INET 4u
+#define K_AF_INET6 6u
+#define K_SOCK_UDP 1u
+#define K_SOCK_TCP 2u
+#define K_NET_MAX_IF 8u
+#define K_NET_MAX_SOCKETS 64u
+#define K_NET_FRAME_MAX 1518u
+#define K_NET_ANY_IF 0xffffffffu
+#define K_NET_UP 1u
+#define K_NET_AUTO6 2u
+#define K_NET_LINK 4u
+#define K_NET_READY4 8u
+#define K_NET_READY6 16u
+#define K_NET_CONFLICT 32u
+#define K_ENETDOWN (-17)
+#define K_ENETUNREACH (-18)
+#define K_ECONNREFUSED (-19)
+#define K_ECONNRESET (-20)
+#define K_EADDRINUSE (-21)
+#define K_EMSGSIZE (-22)
+#define K_EINPROGRESS (-23)
+#define K_ECANCELED (-24)
+typedef struct {
+    UINT32 family, interface;
+    UINT16 port, reserved;
+    UINT8 bytes[16];
+} k_net_address;
+typedef struct {
+    UINT32 interface, flags;
+    UINT8 address[4], mask[4], gateway[4], dns[4];
+    UINT8 address6[16], gateway6[16], dns6[16];
+    UINT32 prefix6, lease_seconds;
+} k_net_config;
+typedef struct {
+    UINT32 id, flags, mtu, speed_mbps;
+    UINT16 vendor, device, pci_bdf, reserved;
+    UINT8 mac[6], pad[2];
+    char name[16], driver[16];
+    k_net_config config;
+    UINT8 link_local6[16];
+    UINT64 rx_packets, tx_packets, rx_bytes, tx_bytes, dropped, errors;
+    UINT64 tcp_retransmits, lease_remaining_ms;
+    INT32 error;
+    UINT32 reserved2;
+} k_net_info;
+typedef struct {
+    UINT32 handle, type, state, owner_task;
+    k_net_address local, peer;
+    UINT32 queued_rx, queued_tx;
+    INT32 error;
+    UINT32 reserved;
+} k_socket_info;
+typedef struct {
+    UINT32 interface, length;
+    UINT64 tick;
+    UINT8 bytes[K_NET_FRAME_MAX];
+} k_net_frame;
+/* Init before AP startup. Socket calls are SMP-safe; receive/send are nonblocking.
+ * Socket handles belong to their creating task. Raw/configuration calls require Ring 1.
+ * IPv4/IPv6 host stack: ARP/NDP, ICMP, UDP, TCP; 8 KiB reassembly, 1500-byte MTU. */
+int k_net_init(void);
+UINT32 k_net_count(void);
+int k_net_get(UINT32, k_net_info *);
+int k_net_configure(const k_net_config *);
+int k_net_parse(const char *, UINT32 family, k_net_address *);
+int k_net_format(const k_net_address *, char *, UINT32 capacity);
+UINT16 k_net_checksum(const void *, UINT32);
+UINT32 k_net_nonce(void); /* Protocol identifiers; not an entropy service. */
+int k_net_socket(UINT32 family, UINT32 type, UINT32 *handle);
+int k_net_bind(UINT32, const k_net_address *);
+int k_net_connect(UINT32, const k_net_address *, UINT32 timeout_ms);
+int k_net_listen(UINT32, UINT32 backlog);
+int k_net_accept(UINT32, UINT32 *handle, k_net_address *peer);
+int k_net_send(UINT32, const void *, UINT32, const k_net_address *destination);
+int k_net_receive(UINT32, void *, UINT32, k_net_address *source);
+int k_net_close(UINT32);
+int k_net_socket_get(UINT32, k_socket_info *);
+int k_net_ping(const k_net_address *, UINT32 timeout_ms, UINT32 *roundtrip_ms);
+int k_net_raw_send(UINT32 interface, const void *, UINT32);
+int k_net_raw_receive(UINT32 interface, k_net_frame *);
+/* Trusted boot-time link drivers. Callbacks are bounded/nonblocking, under the network lock.
+ * RX returns length/EAGAIN; TX copies the frame and returns 0/EAGAIN; link returns 0/1/error. */
+typedef struct {
+    char name[16];
+    UINT8 mac[6];
+    UINT16 mtu;
+    int (*receive)(void *, void *, UINT32);
+    int (*transmit)(void *, const void *, UINT32);
+    int (*link)(void *, UINT32 *speed_mbps);
+    void (*stop)(void *);
+} k_net_driver;
+int k_net_attach(const k_net_driver *, void *, UINT32 *interface);
+/* Wi-Fi drivers provide radio operations; authentication policy belongs to helpers.
+ * Built-in PCI wireless discovery does not imply firmware/association support. */
+#define K_WIFI_MAX 8u
+#define K_WIFI_BSS_MAX 32u
+#define K_WIFI_SCAN 1u
+#define K_WIFI_DISCONNECT 2u
+#define K_WIFI_JOIN 3u
+#define K_WIFI_OPEN 0u
+#define K_WIFI_RSN 1u
+#define K_WIFI_PRIVACY 2u
+typedef struct {
+    UINT32 id, interface, capabilities, state;
+    UINT16 vendor, device, pci_bdf, reserved;
+    char driver[24];
+    INT32 error;
+    UINT32 reserved2;
+} k_wifi_info;
+typedef struct {
+    UINT8 bssid[6], ssid_length, channel, ssid[32];
+    UINT32 security;
+    INT32 signal_dbm;
+} k_wifi_bss;
+typedef struct {
+    UINT32 operation, channel, ssid_length, security;
+    UINT8 bssid[6], reserved[2], ssid[32];
+} k_wifi_request;
+typedef struct {
+    UINT32 interface; /* Ethernet interface returned by k_net_attach. */
+    int (*control)(void *, const k_wifi_request *);
+    int (*scan_result)(void *, UINT32, k_wifi_bss *);
+} k_wifi_ops;
+int k_wifi_get(UINT32, k_wifi_info *);
+int k_wifi_register(UINT32, const k_wifi_ops *, void *context);
+int k_wifi_control(UINT32, const k_wifi_request *);
+int k_wifi_scan_result(UINT32, UINT32, k_wifi_bss *);
+int k_wifi_decode_beacon(const void *, UINT32, k_wifi_bss *);
 
 /* RIEF v1.0 uses little-endian fixed-size records and independent regions.
  * User W^X is enforced; relocations are bounded, sorted and non-overlapping.
@@ -419,6 +552,23 @@ enum {
     K_SYS_MAP = 25,
     K_SYS_SERVICE_REPLY = 26,
     K_SYS_DISKINFO = 27,
-    K_SYS_PARTITIONINFO = 28
+    K_SYS_PARTITIONINFO = 28,
+    K_SYS_NETINFO = 29,
+    K_SYS_NETCONFIG = 30,
+    K_SYS_SOCKET = 31,
+    K_SYS_BIND = 32,
+    K_SYS_CONNECT = 33,
+    K_SYS_LISTEN = 34,
+    K_SYS_ACCEPT = 35,
+    K_SYS_SENDTO = 36,
+    K_SYS_RECVFROM = 37,
+    K_SYS_NETCLOSE = 38,
+    K_SYS_SOCKINFO = 39,
+    K_SYS_RAWSEND = 40,
+    K_SYS_RAWRECV = 41,
+    K_SYS_NETPING = 42,
+    K_SYS_WIFIINFO = 43,
+    K_SYS_WIFICTRL = 44,
+    K_SYS_WIFISCAN = 45
 };
 #endif

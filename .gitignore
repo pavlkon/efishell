@@ -1,13 +1,13 @@
 *.o
 *.efi
+*.EFI
 *.img
 *.vdi
-*.EFI
 OVMF_VARS.fd
 
-kernel.old.c
-kernel.old.h
-os.old.c
+*.old.c
+*.old.h
 
+rief
 correct.sh
 image/

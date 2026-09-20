@@ -70,35 +70,52 @@ typedef struct {
     int nr, args;
 } Builtin;
 static const Builtin builtins[] = {{"exit", 0, 1},
-{"write", 1, 3},
-{"yield", 2, 0},
-{"sleep", 3, 1},
-{"getpid", 4, 0},
-{"ticks", 5, 0},
-{"send", 6, 3},
-{"recv", 7, 2},
-{"open", 8, 2},
-{"read", 9, 3},
-{"close", 10, 1},
-{"mkdir", 11, 1},
-{"sync", 12, 0},
-{"spawn", 13, 4},
-{"procinfo", 14, 2},
-{"waitpid", 15, 3},
-{"control", 16, 2},
-{"admin", 17, 1},
-{"identity", 18, 1},
-{"service_register", 19, 1},
-{"service_lookup", 20, 1},
-{"getcpu", 21, 0},
-{"tlsbase", 22, 0},
-{"getargs", 23, 2},
-{"seek", 24, 3},
-{"map", 25, 3},
-{"service_reply", 26, 3},
-{"diskinfo", 27, 2},
-{"partitioninfo", 28, 2},
-{NULL, 0, 0}};
+                                   {"write", 1, 3},
+                                   {"yield", 2, 0},
+                                   {"sleep", 3, 1},
+                                   {"getpid", 4, 0},
+                                   {"ticks", 5, 0},
+                                   {"send", 6, 3},
+                                   {"recv", 7, 2},
+                                   {"open", 8, 2},
+                                   {"read", 9, 3},
+                                   {"close", 10, 1},
+                                   {"mkdir", 11, 1},
+                                   {"sync", 12, 0},
+                                   {"spawn", 13, 4},
+                                   {"procinfo", 14, 2},
+                                   {"waitpid", 15, 3},
+                                   {"control", 16, 2},
+                                   {"admin", 17, 1},
+                                   {"identity", 18, 1},
+                                   {"service_register", 19, 1},
+                                   {"service_lookup", 20, 1},
+                                   {"getcpu", 21, 0},
+                                   {"tlsbase", 22, 0},
+                                   {"getargs", 23, 2},
+                                   {"seek", 24, 3},
+                                   {"map", 25, 3},
+                                   {"service_reply", 26, 3},
+                                   {"diskinfo", 27, 2},
+                                   {"partitioninfo", 28, 2},
+                                   {"netinfo", 29, 2},
+                                   {"netconfig", 30, 1},
+                                   {"socket", 31, 2},
+                                   {"bind", 32, 2},
+                                   {"connect", 33, 3},
+                                   {"listen", 34, 2},
+                                   {"accept", 35, 2},
+                                   {"sendto", 36, 4},
+                                   {"recvfrom", 37, 4},
+                                   {"netclose", 38, 1},
+                                   {"sockinfo", 39, 2},
+                                   {"rawsend", 40, 3},
+                                   {"rawrecv", 41, 2},
+                                   {"netping", 42, 2},
+                                   {"wifiinfo", 43, 2},
+                                   {"wifictrl", 44, 2},
+                                   {"wifiscan", 45, 3},
+                                   {NULL, 0, 0}};
 static Token tokens[MAX_TOKEN];
 static int nt, pos;
 static Node nodes[MAX_NODE];
@@ -247,15 +264,15 @@ static void lex(const char *p)
             static const char *ops[] = {
                 "<<=", ">>=", "==", "!=", "<=", ">=", "&&", "||", "<<", ">>", "++",
                 "--",  "+=",  "-=", "*=", "/=", "%=", "&=", "|=", "^=", "->", NULL};
-                int n = 1;
-                for (int i = 0; ops[i]; ++i)
-                    if (!strncmp(p, ops[i], strlen(ops[i]))) {
-                        n = (int)strlen(ops[i]);
-                        break;
-                    }
-                    t->kind = 4;
-                t->text = slice(p, (size_t)n);
-                p += n;
+            int n = 1;
+            for (int i = 0; ops[i]; ++i)
+                if (!strncmp(p, ops[i], strlen(ops[i]))) {
+                    n = (int)strlen(ops[i]);
+                    break;
+                }
+            t->kind = 4;
+            t->text = slice(p, (size_t)n);
+            p += n;
         }
     }
     tokens[nt].text = "<eof>";
@@ -315,12 +332,12 @@ static int same(Type *a, Type *b)
     if (a->base && b->base)
         return same(a->base, b->base) && a->count == b->count;
     return !a->base && !b->base && !a->fields && !b->fields && a->size == b->size &&
-    a->uns == b->uns;
+           a->uns == b->uns;
 }
 static int typename_(void)
 {
     return is("int") || is("long") || is("i64") || is("u64") || is("u32") || is("u16") ||
-    is("u8") || is("char") || is("void") || is("struct") || is("const") || is("unsigned");
+           is("u8") || is("char") || is("void") || is("struct") || is("const") || is("unsigned");
 }
 static Type *basetype(void);
 static Type *declarator(Type *t, char **name, int optional)
@@ -558,7 +575,7 @@ static Node *primary(void)
                 n->func = -100 - i;
                 return n;
             }
-            int fi = function_find(name);
+        int fi = function_find(name);
         if (fi < 0)
             die(t->line, "function '%s' needs a declaration", name);
         Function *f = &funcs[fi];
@@ -730,15 +747,15 @@ static int opinfo(const char *s, int *prec)
         const char *s;
         int op, prec;
     } ops[] = {{"||", LOR, 1}, {"&&", LAND, 2}, {"|", BOR, 3},  {"^", BXOR, 4}, {"&", BAND, 5},
-    {"==", EQ, 6},  {"!=", NE, 6},   {"<", LT, 7},   {"<=", LE, 7},  {">", GT, 7},
-    {">=", GE, 7},  {"<<", SHL, 8},  {">>", SHR, 8}, {"+", ADD, 9},  {"-", SUB, 9},
-    {"*", MUL, 10}, {"/", DIV, 10},  {"%", MOD, 10}, {NULL, 0, 0}};
+               {"==", EQ, 6},  {"!=", NE, 6},   {"<", LT, 7},   {"<=", LE, 7},  {">", GT, 7},
+               {">=", GE, 7},  {"<<", SHL, 8},  {">>", SHR, 8}, {"+", ADD, 9},  {"-", SUB, 9},
+               {"*", MUL, 10}, {"/", DIV, 10},  {"%", MOD, 10}, {NULL, 0, 0}};
     for (int i = 0; ops[i].s; ++i)
         if (!strcmp(s, ops[i].s)) {
             *prec = ops[i].prec;
             return ops[i].op;
         }
-        return 0;
+    return 0;
 }
 static Node *binexpr(int min)
 {
@@ -1002,10 +1019,10 @@ static void bytes(const uint8_t *p, int n)
         b(p[i]);
 }
 #define EMIT(...)                                                                                  \
-do {                                                                                           \
-    const uint8_t v_[] = {__VA_ARGS__};                                                        \
-    bytes(v_, (int)sizeof(v_));                                                                \
-} while (0)
+    do {                                                                                           \
+        const uint8_t v_[] = {__VA_ARGS__};                                                        \
+        bytes(v_, (int)sizeof(v_));                                                                \
+    } while (0)
 static void u32(uint32_t v)
 {
     for (int i = 0; i < 4; ++i)
@@ -1136,58 +1153,58 @@ static void arithmetic(int op, Type *left, Type *right)
         u32((uint32_t)left->base->size);
     }
     switch (op) {
-        case ADD:
-            EMIT(0x4c, 0x01, 0xd0);
-            break;
-        case SUB:
-            EMIT(0x49, 0x29, 0xc2, 0x4c, 0x89, 0xd0);
-            if (left->base && right->base) {
-                EMIT(0x48, 0x99, 0x49, 0xc7, 0xc3);
-                u32((uint32_t)left->base->size);
-                EMIT(0x49, 0xf7, 0xfb);
-            }
-            break;
-        case MUL:
-            EMIT(0x49, 0x0f, 0xaf, 0xc2);
-            break;
-        case DIV:
-        case MOD:
-            EMIT(0x49, 0x89, 0xc3, 0x4c, 0x89, 0xd0);
-            if (uns) {
-                EMIT(0x31, 0xd2, 0x49, 0xf7, 0xf3);
-            } else {
-                EMIT(0x48, 0x99, 0x49, 0xf7, 0xfb);
-            }
-            if (op == MOD)
-                EMIT(0x48, 0x89, 0xd0);
+    case ADD:
+        EMIT(0x4c, 0x01, 0xd0);
         break;
-        case SHL:
-        case SHR:
-            EMIT(0x48, 0x89, 0xc1, 0x4c, 0x89, 0xd0);
-            EMIT(0x48, 0xd3);
-            b(op == SHL ? 0xe0 : uns ? 0xe8 : 0xf8);
-            break;
-        case BAND:
-            EMIT(0x4c, 0x21, 0xd0);
-            break;
-        case BOR:
-            EMIT(0x4c, 0x09, 0xd0);
-            break;
-        case BXOR:
-            EMIT(0x4c, 0x31, 0xd0);
-            break;
-        default: {
-            int cc = op == LT   ? (uns ? 0x92 : 0x9c)
-            : op == LE ? (uns ? 0x96 : 0x9e)
-            : op == GT ? (uns ? 0x97 : 0x9f)
-            : op == GE ? (uns ? 0x93 : 0x9d)
-            : op == EQ ? 0x94
-            : 0x95;
-            EMIT(0x49, 0x39, 0xc2, 0x0f);
-            b(cc);
-            EMIT(0xc0, 0x0f, 0xb6, 0xc0);
-            break;
+    case SUB:
+        EMIT(0x49, 0x29, 0xc2, 0x4c, 0x89, 0xd0);
+        if (left->base && right->base) {
+            EMIT(0x48, 0x99, 0x49, 0xc7, 0xc3);
+            u32((uint32_t)left->base->size);
+            EMIT(0x49, 0xf7, 0xfb);
         }
+        break;
+    case MUL:
+        EMIT(0x49, 0x0f, 0xaf, 0xc2);
+        break;
+    case DIV:
+    case MOD:
+        EMIT(0x49, 0x89, 0xc3, 0x4c, 0x89, 0xd0);
+        if (uns) {
+            EMIT(0x31, 0xd2, 0x49, 0xf7, 0xf3);
+        } else {
+            EMIT(0x48, 0x99, 0x49, 0xf7, 0xfb);
+        }
+        if (op == MOD)
+            EMIT(0x48, 0x89, 0xd0);
+        break;
+    case SHL:
+    case SHR:
+        EMIT(0x48, 0x89, 0xc1, 0x4c, 0x89, 0xd0);
+        EMIT(0x48, 0xd3);
+        b(op == SHL ? 0xe0 : uns ? 0xe8 : 0xf8);
+        break;
+    case BAND:
+        EMIT(0x4c, 0x21, 0xd0);
+        break;
+    case BOR:
+        EMIT(0x4c, 0x09, 0xd0);
+        break;
+    case BXOR:
+        EMIT(0x4c, 0x31, 0xd0);
+        break;
+    default: {
+        int cc = op == LT   ? (uns ? 0x92 : 0x9c)
+                 : op == LE ? (uns ? 0x96 : 0x9e)
+                 : op == GT ? (uns ? 0x97 : 0x9f)
+                 : op == GE ? (uns ? 0x93 : 0x9d)
+                 : op == EQ ? 0x94
+                            : 0x95;
+        EMIT(0x49, 0x39, 0xc2, 0x0f);
+        b(cc);
+        EMIT(0xc0, 0x0f, 0xb6, 0xc0);
+        break;
+    }
     }
 }
 static void gen_call(Node *n)
@@ -1243,101 +1260,101 @@ static void gen(Node *n)
     if (!n)
         return;
     switch (n->kind) {
-        case NUM:
-            imm(n->value);
-            break;
-        case STR:
-            ref(2, n->value);
-            break;
-        case VAR:
-        case DEREF:
-        case MEMBER:
-            addr(n);
-            load(n->type);
-            break;
-        case ADDR:
-            addr(n->a);
-            break;
-        case CAST:
-            gen(n->a);
-            cast(n->type);
-            break;
-        case NEG:
-            gen(n->a);
-            EMIT(0x48, 0xf7, 0xd8);
-            break;
-        case BITNOT:
-            gen(n->a);
-            EMIT(0x48, 0xf7, 0xd0);
-            break;
-        case NOT:
-            gen(n->a);
-            EMIT(0x48, 0x85, 0xc0, 0x0f, 0x94, 0xc0, 0x0f, 0xb6, 0xc0);
-            break;
-        case CALL:
-            gen_call(n);
-            break;
-        case BINARY:
-            if (n->op == LAND || n->op == LOR) {
-                gen(n->a);
-                EMIT(0x48, 0x85, 0xc0);
-                int end = jump(n->op == LAND ? 0x84 : 0x85);
-                gen(n->b);
-                fix(end, nc);
-                EMIT(0x48, 0x85, 0xc0, 0x0f, 0x95, 0xc0, 0x0f, 0xb6, 0xc0);
-            } else {
-                gen(n->a);
-                push();
-                gen(n->b);
-                pop10();
-                arithmetic(n->op, n->a->type, n->b->type);
-            }
-            break;
-        case ASSIGN:
-            addr(n->a);
-            push();
-            if (n->op) {
-                load(n->a->type);
-                push();
-            }
-            gen(n->b);
-            if (n->op) {
-                pop10();
-                arithmetic(n->op, n->a->type, n->b->type);
-            }
-            pop10();
-            store(n->type);
-            break;
-        case PRE:
-        case POST: {
-            addr(n->a);
-            push();
-            load(n->type);
-            EMIT(0x49, 0x89, 0xc3);
-            int step = n->type->base ? n->type->base->size : 1;
-            if (step < 1)
-                die(n->line, "incomplete increment");
-            EMIT(0x48, 0x05);
-            u32((uint32_t)(n->op == ADD ? step : -step));
-            pop10();
-            store(n->type);
-            if (n->kind == POST)
-                EMIT(0x4c, 0x89, 0xd8);
-            break;
-        }
-        case COND: {
+    case NUM:
+        imm(n->value);
+        break;
+    case STR:
+        ref(2, n->value);
+        break;
+    case VAR:
+    case DEREF:
+    case MEMBER:
+        addr(n);
+        load(n->type);
+        break;
+    case ADDR:
+        addr(n->a);
+        break;
+    case CAST:
+        gen(n->a);
+        cast(n->type);
+        break;
+    case NEG:
+        gen(n->a);
+        EMIT(0x48, 0xf7, 0xd8);
+        break;
+    case BITNOT:
+        gen(n->a);
+        EMIT(0x48, 0xf7, 0xd0);
+        break;
+    case NOT:
+        gen(n->a);
+        EMIT(0x48, 0x85, 0xc0, 0x0f, 0x94, 0xc0, 0x0f, 0xb6, 0xc0);
+        break;
+    case CALL:
+        gen_call(n);
+        break;
+    case BINARY:
+        if (n->op == LAND || n->op == LOR) {
             gen(n->a);
             EMIT(0x48, 0x85, 0xc0);
-            int no = jump(0x84);
+            int end = jump(n->op == LAND ? 0x84 : 0x85);
             gen(n->b);
-            int end = jump(0);
-            fix(no, nc);
-            gen(n->c);
             fix(end, nc);
-            break;
+            EMIT(0x48, 0x85, 0xc0, 0x0f, 0x95, 0xc0, 0x0f, 0xb6, 0xc0);
+        } else {
+            gen(n->a);
+            push();
+            gen(n->b);
+            pop10();
+            arithmetic(n->op, n->a->type, n->b->type);
         }
-        default:
-            die(n->line, "internal expression error");
+        break;
+    case ASSIGN:
+        addr(n->a);
+        push();
+        if (n->op) {
+            load(n->a->type);
+            push();
+        }
+        gen(n->b);
+        if (n->op) {
+            pop10();
+            arithmetic(n->op, n->a->type, n->b->type);
+        }
+        pop10();
+        store(n->type);
+        break;
+    case PRE:
+    case POST: {
+        addr(n->a);
+        push();
+        load(n->type);
+        EMIT(0x49, 0x89, 0xc3);
+        int step = n->type->base ? n->type->base->size : 1;
+        if (step < 1)
+            die(n->line, "incomplete increment");
+        EMIT(0x48, 0x05);
+        u32((uint32_t)(n->op == ADD ? step : -step));
+        pop10();
+        store(n->type);
+        if (n->kind == POST)
+            EMIT(0x4c, 0x89, 0xd8);
+        break;
+    }
+    case COND: {
+        gen(n->a);
+        EMIT(0x48, 0x85, 0xc0);
+        int no = jump(0x84);
+        gen(n->b);
+        int end = jump(0);
+        fix(no, nc);
+        gen(n->c);
+        fix(end, nc);
+        break;
+    }
+    default:
+        die(n->line, "internal expression error");
     }
 }
 typedef struct Loop {
@@ -1350,64 +1367,64 @@ static void stmt(Node *n, Loop *loop)
     if (!n)
         return;
     switch (n->kind) {
-        case BLOCK:
-            for (Node *p = n->a; p; p = p->next)
-                stmt(p, loop);
+    case BLOCK:
+        for (Node *p = n->a; p; p = p->next)
+            stmt(p, loop);
         break;
-        case EXPR:
+    case EXPR:
+        gen(n->a);
+        break;
+    case RETURN:
+        if (n->a)
             gen(n->a);
-            break;
-        case RETURN:
-            if (n->a)
-                gen(n->a);
         else
             imm(0);
         if (nreturn == 8192)
             die(n->line, "too many returns");
         return_fix[nreturn++] = jump(0);
         break;
-        case IF: {
-            gen(n->a);
+    case IF: {
+        gen(n->a);
+        EMIT(0x48, 0x85, 0xc0);
+        int no = jump(0x84);
+        stmt(n->b, loop);
+        int end = jump(0);
+        fix(no, nc);
+        stmt(n->c, loop);
+        fix(end, nc);
+        break;
+    }
+    case WHILE:
+    case FOR: {
+        Loop l = {0};
+        l.parent = loop;
+        if (n->kind == FOR)
+            stmt(n->a, loop);
+        int start = nc, cond = -1;
+        Node *test = n->kind == FOR ? n->b : n->a;
+        if (test) {
+            gen(test);
             EMIT(0x48, 0x85, 0xc0);
-            int no = jump(0x84);
-            stmt(n->b, loop);
-            int end = jump(0);
-            fix(no, nc);
-            stmt(n->c, loop);
-            fix(end, nc);
-            break;
+            cond = jump(0x84);
         }
-        case WHILE:
-        case FOR: {
-            Loop l = {0};
-            l.parent = loop;
-            if (n->kind == FOR)
-                stmt(n->a, loop);
-            int start = nc, cond = -1;
-            Node *test = n->kind == FOR ? n->b : n->a;
-            if (test) {
-                gen(test);
-                EMIT(0x48, 0x85, 0xc0);
-                cond = jump(0x84);
-            }
-            stmt(n->kind == FOR ? n->d : n->b, &l);
-            int cont = nc;
-            if (n->kind == FOR)
-                gen(n->c);
-            int j = jump(0);
-            fix(j, start);
-            if (cond >= 0)
-                fix(cond, nc);
-            for (int i = 0; i < l.nb; ++i)
-                fix(l.breaks[i], nc);
-            for (int i = 0; i < l.nc; ++i)
-                fix(l.continues[i], cont);
-            break;
-        }
-        case BREAK:
-        case CONTINUE:
-            if (!loop)
-                die(n->line, "break/continue outside loop");
+        stmt(n->kind == FOR ? n->d : n->b, &l);
+        int cont = nc;
+        if (n->kind == FOR)
+            gen(n->c);
+        int j = jump(0);
+        fix(j, start);
+        if (cond >= 0)
+            fix(cond, nc);
+        for (int i = 0; i < l.nb; ++i)
+            fix(l.breaks[i], nc);
+        for (int i = 0; i < l.nc; ++i)
+            fix(l.continues[i], cont);
+        break;
+    }
+    case BREAK:
+    case CONTINUE:
+        if (!loop)
+            die(n->line, "break/continue outside loop");
         if (n->kind == BREAK) {
             if (loop->nb == 1024)
                 die(n->line, "too many breaks");
@@ -1418,8 +1435,8 @@ static void stmt(Node *n, Loop *loop)
             loop->continues[loop->nc++] = jump(0);
         }
         break;
-        default:
-            die(n->line, "internal statement error");
+    default:
+        die(n->line, "internal statement error");
     }
     if (spdepth)
         die(n->line, "internal unbalanced expression stack");
@@ -1475,12 +1492,12 @@ static size_t align8(size_t n) { return (n + 7) & ~(size_t)7; }
 static void output(const char *path)
 {
     size_t relocoff = 192, exportoff = align8(relocoff + (size_t)nr * 40),
-    stringoff = exportoff + (size_t)nf * 16;
+           stringoff = exportoff + (size_t)nf * 16;
     size_t names = 0;
     for (int i = 0; i < nf; ++i)
         names += strlen(funcs[i].name) + 1;
     size_t coff = align8(stringoff + names), doff = align8(coff + (size_t)nc),
-    roff = align8(doff + (size_t)nd), total = roff + (size_t)nro;
+           roff = align8(doff + (size_t)nd), total = roff + (size_t)nro;
     if (total > 4 * 1024 * 1024)
         die(0, "RIEF file exceeds the kernel loader limit of 4 MiB");
     uint8_t *out = alloc(total);
@@ -1544,71 +1561,95 @@ static void output(const char *path)
 }
 static const char *example(const char *name)
 {
+    if (!strcmp(name, "netcheck"))
+        return "struct Address { u32 family; u32 interface; u16 port; u16 reserved; u8 bytes[16]; "
+               "};\n"
+               "struct SocketInfo {u32 handle;u32 type;u32 state;u32 owner;struct Address "
+               "local;struct Address peer;u32 rx;u32 tx;u32 error;u32 reserved;};\n"
+               "int main() {\n"
+               "    struct Address a; struct SocketInfo info; u8 frame[60]; u8 result[8];\n"
+               "    u8 *p=(u8*)&a;for(int i=0;i<sizeof(a);i++)p[i]=0;\n"
+               "    for(int i=0;i<60;i++)frame[i]=0;\n"
+               "    a.family=4;a.interface=0;a.bytes[0]=127;a.bytes[3]=1;\n"
+               "    int h=socket(4,1);if(h<0)return 1;\n"
+               "    if(bind(h,&a)<0)return 2;\n"
+               "    if(sockinfo(h,&info)<0)return 3;a.port=info.local.port;\n"
+               "    if(sendto(h,(u8*)0,1,&a)!=-5)return 4;\n"
+               "    if(rawsend(0,frame,60)!=-11)return 5;\n"
+               "    if(rawrecv(0,0)!=-11)return 6;\n"
+               "    if(sendto(h,\"RIEFnet\",7,&a)!=7)return 7;\n"
+               "    int n=-10;\n"
+               "    for(int i=0;i<500;i++){n=recvfrom(h,(u8*)0,7,0);if(n!=-5)return "
+               "8;n=recvfrom(h,result,8,0);if(n!=-10)break;sleep(10);}\n"
+               "    if(n!=7)return 9;for(int i=0;i<7;i++)if(result[i]!=\"RIEFnet\"[i])return 10;\n"
+               "    if(netclose(h)!=0)return 11;if(sockinfo(h,&info)!=-11)return 12;\n"
+               "    return 0;\n"
+               "}\n";
     if (!strcmp(name, "hello"))
         return "int main() { write(1, \"Hello from compiled RIEF!\\n\", 26); "
-        "return 42; }\n";
+               "return 42; }\n";
     if (!strcmp(name, "worker"))
         return "_Thread_local u64 counter;\nint main() { for (int i=0; i<1000; "
-        "i++) { counter++; sleep(1); } return counter == 1000 ? 0 : 1; }\n";
+               "i++) { counter++; sleep(1); } return counter == 1000 ? 0 : 1; }\n";
     if (!strcmp(name, "helper"))
         return "struct Message { u32 sender; u32 size; u8 bytes[128]; };\n"
-        "u64 hash(u8 *p, u64 n) { u64 h=14695981039346656037; for (u64 "
-        "i=0;i<n;i++) { h ^= p[i]; h *= 1099511628211; } return h; }\n"
-        "int main() { struct Message msg; u64 reply; if "
-        "(service_register(\"hash\") < 0) return 1;\n"
-        "  while (1) { int e=recv(&msg,sizeof(msg)); if (e == -10) { "
-        "sleep(1); continue; }\n"
-        "    if (e < 0) return 2; reply=hash(msg.bytes,msg.size); "
-        "service_reply(msg.sender,&reply,8); } }\n";
+               "u64 hash(u8 *p, u64 n) { u64 h=14695981039346656037; for (u64 "
+               "i=0;i<n;i++) { h ^= p[i]; h *= 1099511628211; } return h; }\n"
+               "int main() { struct Message msg; u64 reply; if "
+               "(service_register(\"hash\") < 0) return 1;\n"
+               "  while (1) { int e=recv(&msg,sizeof(msg)); if (e == -10) { "
+               "sleep(1); continue; }\n"
+               "    if (e < 0) return 2; reply=hash(msg.bytes,msg.size); "
+               "service_reply(msg.sender,&reply,8); } }\n";
     if (!strcmp(name, "client"))
         return "struct Message { u32 sender; u32 size; u8 bytes[128]; };\n"
-        "int main() { struct Message msg; int t=service_lookup(\"hash\"); "
-        "if(t<0)return 1;\n"
-        " if(send(t,\"hello\",5)<0)return 2; for(int "
-        "i=0;i<1000;i++){if(recv(&msg,sizeof(msg))==0){write(1,\"helper "
-        "replied\\n\",15);return msg.sender==t && msg.size==8 && "
-        "*(u64*)msg.bytes==0xa430d84680aabd0b?0:3;}sleep(1);}return 4;}\n";
+               "int main() { struct Message msg; int t=service_lookup(\"hash\"); "
+               "if(t<0)return 1;\n"
+               " if(send(t,\"hello\",5)<0)return 2; for(int "
+               "i=0;i<1000;i++){if(recv(&msg,sizeof(msg))==0){write(1,\"helper "
+               "replied\\n\",15);return msg.sender==t && msg.size==8 && "
+               "*(u64*)msg.bytes==0xa430d84680aabd0b?0:3;}sleep(1);}return 4;}\n";
     if (!strcmp(name, "root"))
         return "struct Identity { u64 uuid[2]; u32 pid; u32 parent; u32 "
-        "execution_class; u32 cpu; u64 tls; u64 reserved[3]; };\n"
-        "int main(){struct Identity me;if(identity(&me)<0)return "
-        "1;if(me.execution_class!=1)return 2;write(1,\"Ring 1 authority "
-        "active\\n\",24);return 0;}\n";
+               "execution_class; u32 cpu; u64 tls; u64 reserved[3]; };\n"
+               "int main(){struct Identity me;if(identity(&me)<0)return "
+               "1;if(me.execution_class!=1)return 2;write(1,\"Ring 1 authority "
+               "active\\n\",24);return 0;}\n";
     if (!strcmp(name, "ring1check"))
         return "struct Identity { u64 uuid[2]; u32 pid; u32 parent; u32 execution_class; u32 cpu; "
-        "u64 tls; u64 reserved[3]; };\n"
-        "struct Request { u32 version; u32 size; u32 operation; u32 flags; u64 caller[2]; "
-        "u64 target[2]; u32 pid; u32 resource; u64 address; u64 length; u64 value; u64 "
-        "buffer; };\n"
-        "int main() {\n"
-        "    struct Identity me; struct Request r;\n"
-        "    if(identity(&me)<0) return 1;\n"
-        "    u8 *bytes=(u8*)&r; for(int i=0;i<sizeof(r);i++)bytes[i]=0;\n"
-        "    r.version=1; r.size=sizeof(r); r.operation=3;\n"
-        "    "
-        "r.caller[0]=me.uuid[0];r.caller[1]=me.uuid[1];r.target[0]=me.uuid[0];r.target[1]="
-        "me.uuid[1];r.pid=me.pid;\n"
-        "    r.address=0x200000000000;r.length=4096;r.value=3;\n"
-        "    if(me.execution_class==3)return admin(&r)==-11?0:2;\n"
-        "    r.caller[0]^=1;if(admin(&r)!=-11)return 3;r.caller[0]^=1;\n"
-        "    r.address=0;if(admin(&r)!=-1)return 4;\n"
-        "    r.address=0x200000000000;r.value=7;if(admin(&r)!=-1)return 5;\n"
-        "    r.value=3;if(admin(&r)!=0)return 6;\n"
-        "    u64 *weird=(u64*)r.address;*weird=0x1234abcd;\n"
-        "    if(*weird!=0x1234abcd)return 7;\n"
-        "    if(admin(&r)!=-15)return 8;\n"
-        "    return 0;\n"
-        "}\n";
+               "u64 tls; u64 reserved[3]; };\n"
+               "struct Request { u32 version; u32 size; u32 operation; u32 flags; u64 caller[2]; "
+               "u64 target[2]; u32 pid; u32 resource; u64 address; u64 length; u64 value; u64 "
+               "buffer; };\n"
+               "int main() {\n"
+               "    struct Identity me; struct Request r;\n"
+               "    if(identity(&me)<0) return 1;\n"
+               "    u8 *bytes=(u8*)&r; for(int i=0;i<sizeof(r);i++)bytes[i]=0;\n"
+               "    r.version=1; r.size=sizeof(r); r.operation=3;\n"
+               "    "
+               "r.caller[0]=me.uuid[0];r.caller[1]=me.uuid[1];r.target[0]=me.uuid[0];r.target[1]="
+               "me.uuid[1];r.pid=me.pid;\n"
+               "    r.address=0x200000000000;r.length=4096;r.value=3;\n"
+               "    if(me.execution_class==3)return admin(&r)==-11?0:2;\n"
+               "    r.caller[0]^=1;if(admin(&r)!=-11)return 3;r.caller[0]^=1;\n"
+               "    r.address=0;if(admin(&r)!=-1)return 4;\n"
+               "    r.address=0x200000000000;r.value=7;if(admin(&r)!=-1)return 5;\n"
+               "    r.value=3;if(admin(&r)!=0)return 6;\n"
+               "    u64 *weird=(u64*)r.address;*weird=0x1234abcd;\n"
+               "    if(*weird!=0x1234abcd)return 7;\n"
+               "    if(admin(&r)!=-15)return 8;\n"
+               "    return 0;\n"
+               "}\n";
     if (!strcmp(name, "tlscheck"))
         return "_Thread_local u64 counter;\n"
-        "int main() {\n"
-        "    u64 *tcb=(u64*)tlsbase();\n"
-        "    if(tcb[0]!=(u64)tcb || tcb[1]!=getpid() || counter!=0)return 1;\n"
-        "    u64 original=getcpu();\n"
-        "    for(int i=0;i<100;i++){ counter++; sleep(10); "
-        "if(counter!=i+1||tcb[1]!=getpid()||getcpu()!=original)return 2; }\n"
-        "    return 0;\n"
-        "}\n";
+               "int main() {\n"
+               "    u64 *tcb=(u64*)tlsbase();\n"
+               "    if(tcb[0]!=(u64)tcb || tcb[1]!=getpid() || counter!=0)return 1;\n"
+               "    u64 original=getcpu();\n"
+               "    for(int i=0;i<100;i++){ counter++; sleep(10); "
+               "if(counter!=i+1||tcb[1]!=getpid()||getcpu()!=original)return 2; }\n"
+               "    return 0;\n"
+               "}\n";
     return NULL;
 }
 int main(int argc, char **argv)
@@ -1622,7 +1663,7 @@ int main(int argc, char **argv)
     }
     if (argc < 2) {
         fprintf(stderr, "Usage: rief input.c -o output.rief\n       rief --example "
-        "hello|worker|helper|client|root|ring1check|tlscheck\n");
+                        "hello|worker|helper|client|root|ring1check|tlscheck|netcheck\n");
         return 1;
     }
     const char *out = "a.rief";
