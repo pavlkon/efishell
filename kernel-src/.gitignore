@@ -1,0 +1,22 @@
+# Build outputs
+/build/
+*.o
+*.d
+*.efi
+*.EFI
+*.img
+*.iso
+*.vdi
+OVMF_VARS.fd
+rief
+rief.exe
+image/
+
+# VirtualBox state
+/vbox/
+
+# Local backups and scripts
+*.old.c
+*.old.h
+*.old.S
+correct.sh
